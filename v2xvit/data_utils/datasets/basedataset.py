@@ -16,6 +16,8 @@ from v2xvit.hypes_yaml.yaml_utils import load_yaml
 from v2xvit.utils.pcd_utils import downsample_lidar_minimum
 from v2xvit.utils.transformation_utils import x1_to_x2
 
+from v2xvit.utils.spatial_aligner import CentroidConsensusAligner
+
 
 class BaseDataset(Dataset):
     """
@@ -168,6 +170,9 @@ class BaseDataset(Dataset):
                         self.len_record.append(prev_last + len(timestamps))
                 else:
                     self.scenario_database[i][cav_id]['ego'] = False
+
+        # adding our custom aligner for spatial correction, which is based on centroid consensus
+        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=2.5)
 
     def __len__(self):
         return self.len_record[-1]
