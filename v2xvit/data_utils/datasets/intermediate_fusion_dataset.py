@@ -211,42 +211,61 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             The dictionary contains the cav's processed information.
         """
 
-
-# =========================================================================
+        # =========================================================================
         # --- SPATIAL ALIGNMENT HOOK (APPROACH 1: CENTROID CONSENSUS) ---
         # =========================================================================
         if hasattr(self, 'aligner'):
-            # 1. Identify Ego CAV (its transformation matrix is Identity)
+            # 1. Safely identify Ego CAV (skipping metadata primitives)
             ego_id = None
             for cav_id, cav_content in selected_cav_base.items():
-                if np.allclose(cav_content['transformation_matrix'], np.eye(4)):
-                    ego_id = cav_id
-                    break
-            
-            # Fallback if no identity matrix found
-            if ego_id is None:
-                ego_id = list(selected_cav_base.keys())[0]
-
-            # 2. Extract Ego local bounding boxes
-            ego_boxes = selected_cav_base[ego_id].get('object_bbx_center', None)
-
-            # 3. Correct noisy transformation matrices for all connected Sender CAVs
-            for cav_id, cav_content in selected_cav_base.items():
-                if cav_id == ego_id:
+                if not isinstance(cav_content, dict):
                     continue
                 
-                sender_boxes_local = cav_content.get('object_bbx_center', None)
-                noisy_T = cav_content['transformation_matrix']
+                # Check if marked as ego or matrix is Identity
+                if cav_content.get('ego', False) is True:
+                    ego_id = cav_id
+                    break
+                if 'transformation_matrix' in cav_content:
+                    if np.allclose(cav_content['transformation_matrix'], np.eye(4), atol=1e-3):
+                        ego_id = cav_id
+                        break
+            
+            # Fallback if no explicit identity matrix is found
+            if ego_id is None:
+                for cav_id, cav_content in selected_cav_base.items():
+                    if isinstance(cav_content, dict) and 'transformation_matrix' in cav_content:
+                        ego_id = cav_id
+                        break
 
-                # Compute corrected matrix using Approach 1 (SVD / Kabsch)
-                corrected_T = self.aligner.correct_pose_matrix(
-                    T_noisy=noisy_T,
-                    ego_boxes=ego_boxes,
-                    sender_boxes=sender_boxes_local
+            # 2. Extract Ego local bounding boxes (if available)
+            if ego_id is not None:
+                ego_boxes = selected_cav_base[ego_id].get(
+                    'object_bbx_center', 
+                    selected_cav_base[ego_id].get('object_bbx_center_single', None)
                 )
 
-                # Overwrite transformation matrix with corrected values
-                selected_cav_base[cav_id]['transformation_matrix'] = corrected_T
+                # 3. Correct noisy transformation matrices for connected Sender CAVs
+                for cav_id, cav_content in selected_cav_base.items():
+                    if not isinstance(cav_content, dict) or cav_id == ego_id:
+                        continue
+                    if 'transformation_matrix' not in cav_content:
+                        continue
+
+                    sender_boxes_local = cav_content.get(
+                        'object_bbx_center', 
+                        cav_content.get('object_bbx_center_single', None)
+                    )
+                    noisy_T = cav_content['transformation_matrix']
+
+                    # Compute corrected matrix using Approach 1 (SVD / Kabsch)
+                    corrected_T = self.aligner.correct_pose_matrix(
+                        T_noisy=noisy_T,
+                        ego_boxes=ego_boxes,
+                        sender_boxes=sender_boxes_local
+                    )
+
+                    # Overwrite transformation matrix with corrected values
+                    selected_cav_base[cav_id]['transformation_matrix'] = corrected_T
         # =========================================================================
         print("Alignment Hook Active!")
         selected_cav_processed = {}
