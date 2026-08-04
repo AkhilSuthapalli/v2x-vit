@@ -29,7 +29,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             params['postprocess'],
             train)
 
-        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=2.5)
+        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=4.0)
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
@@ -39,6 +39,66 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         base_data_dict = \
             self.retrieve_base_data(idx,
                                     cur_ego_pose_flag=self.cur_ego_pose_flag)
+
+        # =========================================================================
+        # --- SPATIAL ALIGNMENT HOOK (APPROACH 1: CENTROID CONSENSUS) ---
+        # =========================================================================
+        if hasattr(self, 'aligner') and self.aligner is not None:
+            def _get_cav_boxes(cav_dict):
+                if not isinstance(cav_dict, dict) or 'params' not in cav_dict:
+                    return None
+                params = cav_dict['params']
+                if 'vehicles' in params and isinstance(params['vehicles'], dict):
+                    locs = [v['location'] for v in params['vehicles'].values() if isinstance(v, dict) and 'location' in v]
+                    if len(locs) > 0:
+                        return np.array(locs)
+                return None
+
+            # 1. Identify Ego CAV ID
+            ego_id = None
+            for cav_id, cav_content in base_data_dict.items():
+                if isinstance(cav_content, dict):
+                    if cav_content.get('ego', False) is True:
+                        ego_id = cav_id
+                        break
+                    if 'params' in cav_content and 'transformation_matrix' in cav_content['params']:
+                        if np.allclose(cav_content['params']['transformation_matrix'], np.eye(4), atol=1e-3):
+                            ego_id = cav_id
+                            break
+
+            if ego_id is None and len(base_data_dict) > 0:
+                ego_id = list(base_data_dict.keys())[0]
+
+            # 2. Extract Ego bounding box centers and correct sender CAVs
+            if ego_id is not None and ego_id in base_data_dict:
+                ego_boxes = _get_cav_boxes(base_data_dict[ego_id])
+
+                for cav_id, cav_content in base_data_dict.items():
+                    if cav_id == ego_id or not isinstance(cav_content, dict):
+                        continue
+                    if 'params' not in cav_content or 'transformation_matrix' not in cav_content['params']:
+                        continue
+
+                    sender_boxes = _get_cav_boxes(cav_content)
+                    noisy_T = cav_content['params']['transformation_matrix'].copy()
+
+                    if ego_boxes is not None and sender_boxes is not None and len(ego_boxes) > 0 and len(sender_boxes) > 0:
+                        # Apply Centroid Alignment (SVD / Kabsch)
+                        corrected_T = self.aligner.correct_pose_matrix(
+                            T_noisy=noisy_T,
+                            ego_boxes=ego_boxes,
+                            sender_boxes=sender_boxes
+                        )
+
+                        matrix_changed = not np.allclose(noisy_T, corrected_T)
+                        print(f"[ALIGNMENT SUCCESS] CAV '{cav_id}' | Matrix Corrected?: {matrix_changed}")
+                        if matrix_changed:
+                            print(f"   Noisy  Shift (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
+                            print(f"   Fixed  Shift (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
+
+                        # Overwrite transformation matrix before feature extraction
+                        base_data_dict[cav_id]['params']['transformation_matrix'] = corrected_T
+        # =========================================================================
 
         processed_data_dict = OrderedDict()
         processed_data_dict['ego'] = {}
@@ -210,88 +270,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         selected_cav_processed : dict
             The dictionary contains the cav's processed information.
         """
-        # =========================================================================
-        # --- TEMPORARY DIAGNOSTIC PRINT ---
-        # =========================================================================
-        """
-        print("\n" + "="*60)
-        print("[DIAGNOSTIC] Keys in selected_cav_base_dict:", list(selected_cav_base.keys()))
-        
-        if 'params' in selected_cav_base:
-            print("[DIAGNOSTIC] 'params' contents:", selected_cav_base['params'])
-        
-        for k, v in selected_cav_base.items():
-            if k != 'params' and isinstance(v, dict):
-                print(f"[DIAGNOSTIC] CAV '{k}' keys:", list(v.keys()))
-                if 'ego' in v:
-                    print(f"   -> is_ego: {v['ego']}")
-                if 'transformation_matrix' in v:
-                    print(f"   -> matrix translation (X,Y): ({v['transformation_matrix'][0,3]:.3f}, {v['transformation_matrix'][1,3]:.3f})")
-        print("="*60 + "\n")
-        # =========================================================================
-        """
-        # =========================================================================
-        # --- SPATIAL ALIGNMENT HOOK (APPROACH 1: CENTROID CONSENSUS) ---
-        # =========================================================================
-        if hasattr(self, 'aligner') and self.aligner is not None:
-            # Helper to extract 3D box centroids (N, 3) from params['vehicles']
-            def _get_cav_boxes(cav_dict):
-                if not isinstance(cav_dict, dict) or 'params' not in cav_dict:
-                    return None
-                params = cav_dict['params']
-                if 'vehicles' in params and isinstance(params['vehicles'], dict):
-                    locs = [v['location'] for v in params['vehicles'].values() if isinstance(v, dict) and 'location' in v]
-                    if len(locs) > 0:
-                        return np.array(locs)
-                return None
-
-            # 1. Identify Ego CAV ID (its transformation matrix is Identity)
-            ego_id = None
-            for cav_id, cav_content in selected_cav_base.items():
-                if isinstance(cav_content, dict):
-                    if cav_content.get('ego', False) is True:
-                        ego_id = cav_id
-                        break
-                    if 'params' in cav_content and 'transformation_matrix' in cav_content['params']:
-                        if np.allclose(cav_content['params']['transformation_matrix'], np.eye(4), atol=1e-3):
-                            ego_id = cav_id
-                            break
-
-            if ego_id is None and len(selected_cav_base) > 0:
-                ego_id = list(selected_cav_base.keys())[0]
-
-            # 2. Extract Ego bounding box centers
-            if ego_id is not None and ego_id in selected_cav_base:
-                ego_boxes = _get_cav_boxes(selected_cav_base[ego_id])
-
-                # 3. Iterate over Sender CAVs and correct their transformation matrix
-                for cav_id, cav_content in selected_cav_base.items():
-                    if cav_id == ego_id or not isinstance(cav_content, dict):
-                        continue
-                    if 'params' not in cav_content or 'transformation_matrix' not in cav_content['params']:
-                        continue
-
-                    sender_boxes = _get_cav_boxes(cav_content)
-                    noisy_T = cav_content['params']['transformation_matrix'].copy()
-
-                    if ego_boxes is not None and sender_boxes is not None and len(ego_boxes) > 0 and len(sender_boxes) > 0:
-                        # Apply Centroid Alignment (SVD / Kabsch)
-                        corrected_T = self.aligner.correct_pose_matrix(
-                            T_noisy=noisy_T,
-                            ego_boxes=ego_boxes,
-                            sender_boxes=sender_boxes
-                        )
-
-                        matrix_changed = not np.allclose(noisy_T, corrected_T)
-                        print(f"[ALIGNMENT SUCCESS] CAV '{cav_id}' | Matrix Corrected?: {matrix_changed}")
-                        if matrix_changed:
-                            print(f"   Noisy  Shift (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
-                            print(f"   Fixed  Shift (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
-
-                        # Overwrite transformation matrix before feature extraction
-                        selected_cav_base[cav_id]['params']['transformation_matrix'] = corrected_T
-        # =========================================================================
-        print("Alignment Hook Active!")
         selected_cav_processed = {}
 
         # calculate the transformation matrix
