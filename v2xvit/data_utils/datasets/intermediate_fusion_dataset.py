@@ -210,6 +210,24 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         selected_cav_processed : dict
             The dictionary contains the cav's processed information.
         """
+        # =========================================================================
+        # --- TEMPORARY DIAGNOSTIC PRINT ---
+        # =========================================================================
+        print("\n" + "="*60)
+        print("[DIAGNOSTIC] Keys in selected_cav_base_dict:", list(selected_cav_base.keys()))
+        
+        if 'params' in selected_cav_base:
+            print("[DIAGNOSTIC] 'params' contents:", selected_cav_base['params'])
+        
+        for k, v in selected_cav_base.items():
+            if k != 'params' and isinstance(v, dict):
+                print(f"[DIAGNOSTIC] CAV '{k}' keys:", list(v.keys()))
+                if 'ego' in v:
+                    print(f"   -> is_ego: {v['ego']}")
+                if 'transformation_matrix' in v:
+                    print(f"   -> matrix translation (X,Y): ({v['transformation_matrix'][0,3]:.3f}, {v['transformation_matrix'][1,3]:.3f})")
+        print("="*60 + "\n")
+        # =========================================================================
 
         # =========================================================================
         # --- SPATIAL ALIGNMENT HOOK (APPROACH 1: CENTROID CONSENSUS) ---
