@@ -215,13 +215,11 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         # --- SPATIAL ALIGNMENT HOOK (APPROACH 1: CENTROID CONSENSUS) ---
         # =========================================================================
         if hasattr(self, 'aligner'):
-            # 1. Safely identify Ego CAV (skipping metadata primitives)
+            # 1. Safely identify Ego CAV
             ego_id = None
             for cav_id, cav_content in selected_cav_base.items():
                 if not isinstance(cav_content, dict):
                     continue
-                
-                # Check if marked as ego or matrix is Identity
                 if cav_content.get('ego', False) is True:
                     ego_id = cav_id
                     break
@@ -229,22 +227,24 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     if np.allclose(cav_content['transformation_matrix'], np.eye(4), atol=1e-3):
                         ego_id = cav_id
                         break
-            
-            # Fallback if no explicit identity matrix is found
+
             if ego_id is None:
                 for cav_id, cav_content in selected_cav_base.items():
                     if isinstance(cav_content, dict) and 'transformation_matrix' in cav_content:
                         ego_id = cav_id
                         break
 
-            # 2. Extract Ego local bounding boxes (if available)
+            print(f"\n[DEBUG] Ego CAV ID found: {ego_id}")
+
             if ego_id is not None:
+                # Retrieve bounding box centers for Ego
                 ego_boxes = selected_cav_base[ego_id].get(
                     'object_bbx_center', 
                     selected_cav_base[ego_id].get('object_bbx_center_single', None)
                 )
 
-                # 3. Correct noisy transformation matrices for connected Sender CAVs
+                print(f"[DEBUG] Ego boxes type: {type(ego_boxes)}, count: {len(ego_boxes) if ego_boxes is not None else 'None'}")
+
                 for cav_id, cav_content in selected_cav_base.items():
                     if not isinstance(cav_content, dict) or cav_id == ego_id:
                         continue
@@ -255,16 +255,24 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                         'object_bbx_center', 
                         cav_content.get('object_bbx_center_single', None)
                     )
-                    noisy_T = cav_content['transformation_matrix']
+                    noisy_T = cav_content['transformation_matrix'].copy()
 
-                    # Compute corrected matrix using Approach 1 (SVD / Kabsch)
+                    print(f"[DEBUG] Sender CAV ID: {cav_id}")
+                    print(f"[DEBUG] Sender boxes count: {len(sender_boxes_local) if sender_boxes_local is not None else 'None'}")
+                    print(f"[DEBUG] Original Noisy T Translation (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
+
+                    # Apply Centroid Alignment
                     corrected_T = self.aligner.correct_pose_matrix(
                         T_noisy=noisy_T,
                         ego_boxes=ego_boxes,
                         sender_boxes=sender_boxes_local
                     )
 
-                    # Overwrite transformation matrix with corrected values
+                    print(f"[DEBUG] Corrected T Translation (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
+                    print(f"[DEBUG] Did Matrix Change?: {not np.allclose(noisy_T, corrected_T)}")
+                    print("-" * 50)
+
+                    # Overwrite transformation matrix
                     selected_cav_base[cav_id]['transformation_matrix'] = corrected_T
         # =========================================================================
         print("Alignment Hook Active!")
