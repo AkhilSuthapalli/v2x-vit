@@ -2,20 +2,17 @@ import numpy as np
 
 class CentroidConsensusAligner:
     """
-    Approach 1: Single-Centroid SVD Aligner with Mutual 1-to-1 Matching,
-    Median Displacement Consensus, and Deadband Filtering (<0.35m).
+    Approach 1: Single-Centroid SVD Aligner with Strict Multi-Pair Consensus,
+    Cross-Lane Rejection (<2.0m gate), and Consensus Variance Guard.
     """
-    def __init__(self, method="svd", max_match_dist=3.0, min_match_dist=0.05, deadband_thresh=0.35):
+    def __init__(self, method="svd", max_match_dist=2.0, min_match_dist=0.05, deadband_thresh=0.35, min_pairs=2):
         self.method = method
-        self.max_match_dist = max_match_dist
+        self.max_match_dist = max_match_dist  # 2.0m prevents adjacent lane (3.5m) false matches
         self.min_match_dist = min_match_dist
-        self.deadband_thresh = deadband_thresh  # Threshold in meters (0.35m)
+        self.deadband_thresh = deadband_thresh
+        self.min_pairs = min_pairs            # Requires at least 2 co-observed pairs
 
     def match_centroids(self, ego_boxes, snd_in_ego_boxes):
-        """
-        Performs mutual (1-to-1) nearest-neighbor matching to prevent
-        cross-vehicle duplicate pairing.
-        """
         ego_centers = ego_boxes[:, :2]
         snd_centers = snd_in_ego_boxes[:, :2]
 
@@ -25,9 +22,9 @@ class CentroidConsensusAligner:
         diff = ego_centers[:, None, :] - snd_centers[None, :, :]
         dist_matrix = np.linalg.norm(diff, axis=-1)
 
-        # Mutual nearest neighbor matching
-        ego_to_snd = np.argmin(dist_matrix, axis=1)  # Best sender for each ego
-        snd_to_ego = np.argmin(dist_matrix, axis=0)  # Best ego for each sender
+        # Mutual 1-to-1 nearest neighbor matching
+        ego_to_snd = np.argmin(dist_matrix, axis=1)
+        snd_to_ego = np.argmin(dist_matrix, axis=0)
 
         matched_ego = []
         matched_snd = []
@@ -44,34 +41,38 @@ class CentroidConsensusAligner:
     def compute_rigid_delta(self, matched_ego, matched_snd):
         T_delta = np.identity(4, dtype=np.float64)
 
-        if len(matched_ego) == 0:
+        # RULE 1: Require minimum co-observed pairs (K >= 2)
+        if len(matched_ego) < self.min_pairs:
             return T_delta, 0.0
 
-        # Pairwise displacement vectors
-        displacements = matched_ego - matched_snd  # (K, 2)
-        
-        # Calculate robust consensus displacement using MEDIAN (ignores 3.5m cross-lane outliers)
-        median_shift = np.median(displacements, axis=0)
+        displacements = matched_ego - matched_snd
 
-        # Filter out outlier matched pairs that deviate from median shift (> 1.5m deviation)
+        # RULE 2: Reject pairwise outliers using median shift
+        median_shift = np.median(displacements, axis=0)
         pair_deviations = np.linalg.norm(displacements - median_shift, axis=1)
-        inliers = pair_deviations < 1.5
+        inliers = pair_deviations < 1.0  # Strict 1.0m deviation filter
 
         valid_ego = matched_ego[inliers]
         valid_snd = matched_snd[inliers]
 
-        if len(valid_ego) == 0:
+        if len(valid_ego) < self.min_pairs:
             return T_delta, 0.0
 
-        # Compute shift magnitude on clean inliers
         inlier_displacements = valid_ego - valid_snd
+
+        # RULE 3: Check pairwise shift variance (must agree with each other)
+        shift_std = np.std(inlier_displacements, axis=0)
+        if np.max(shift_std) > 0.6:  # High variance indicates bad match
+            return T_delta, 0.0
+
         consensus_shift = np.mean(inlier_displacements, axis=0)
         consensus_shift_mag = np.linalg.norm(consensus_shift)
 
+        # RULE 4: Deadband filter
         if consensus_shift_mag < self.deadband_thresh:
             return T_delta, consensus_shift_mag
 
-        # Solve closed-form SVD on consensus inliers
+        # Closed-form SVD on validated inliers
         c_ego = np.mean(valid_ego, axis=0)
         c_snd = np.mean(valid_snd, axis=0)
 
@@ -110,14 +111,10 @@ class CentroidConsensusAligner:
 
         m_ego, m_snd = self.match_centroids(ego_boxes, snd_in_ego_boxes)
 
-        if len(m_ego) == 0:
-            return T_noisy
-
         T_delta, shift_mag = self.compute_rigid_delta(m_ego, m_snd)
 
         if shift_mag < self.deadband_thresh:
-            print(f"[FILTER BYPASS] Shift: {shift_mag:.3f}m < {self.deadband_thresh}m -> Keeping T_noisy")
             return T_noisy
         else:
-            print(f"[FILTER TRIGGERED] Shift: {shift_mag:.3f}m >= {self.deadband_thresh}m -> Applying SVD correction")
+            print(f"[ALIGNMENT ACTIVE] Shift: {shift_mag:.3f}m >= {self.deadband_thresh}m | Pairs: {len(m_ego)}")
             return T_delta @ T_noisy
