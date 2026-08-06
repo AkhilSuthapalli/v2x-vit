@@ -29,7 +29,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             params['postprocess'],
             train)
 
-        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=4.0, deadband_thresh=0.30)
+        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=4.0, deadband_thresh=0.35)
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
