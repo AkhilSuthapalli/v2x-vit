@@ -621,29 +621,24 @@ def save_o3d_visualization(element, save_path):
     save_path : str
         The save path.
     """
-    import time
     vis = o3d.visualization.Visualizer()
-    # 1. Create window with explicit offscreen visibility settings
     vis.create_window(visible=False, width=1280, height=720)
 
-    # 2. Add geometries and set render options
     for i in range(len(element)):
         vis.add_geometry(element[i])
-        vis.update_geometry(element[i])
 
     opt = vis.get_render_option()
     opt.background_color = np.array([0.1, 0.1, 0.1])  # Dark grey background
-    opt.point_size = 2.0                               # Increase point thickness
+    opt.point_size = 2.0                               # Thicker points for visibility
 
-    # 3. Recalculate camera position to encapsulate point cloud bounding box
-    vis.reset_view_point_cameras()
+    # Correct Open3D method to auto-center camera on point cloud extent
+    vis.reset_view_point(True)
 
-    # 4. Cycle renderer multiple times to allow OpenGL frame buffer to swap
+    # Cycle renderer buffer so virtual display (xvfb) captures geometry
     for _ in range(10):
         vis.poll_events()
         vis.update_renderer()
 
-    # 5. Capture rendered image
     vis.capture_screen_image(save_path)
     vis.destroy_window()
 
