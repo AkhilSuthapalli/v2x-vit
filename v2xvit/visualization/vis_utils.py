@@ -4,12 +4,17 @@ import cv2
 import numpy as np
 import open3d as o3d
 import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from matplotlib import cm
 
 from v2xvit.utils import box_utils
 from v2xvit.utils import common_utils
+
+import matplotlib.patches as patches
+from scipy.spatial import ConvexHull
+
 
 VIRIDIS = np.array(cm.get_cmap('plasma').colors)
 VID_RANGE = np.linspace(0.0, 1.0, VIRIDIS.shape[0])
@@ -271,46 +276,80 @@ def visualize_single_sample_output_gt(pred_tensor,
         Color rendering mode.
     """
 
-    def custom_draw_geometry(pcd, pred, gt):
-        vis = o3d.visualization.Visualizer()
-        vis.create_window()
+    # 1. Convert PyTorch tensors to NumPy arrays safely
+    if hasattr(pcd, 'cpu'):
+        pcd = pcd.cpu().numpy()
+    if hasattr(pred_tensor, 'cpu'):
+        pred_tensor = pred_tensor.cpu().numpy()
+    if hasattr(gt_tensor, 'cpu'):
+        gt_tensor = gt_tensor.cpu().numpy()
 
-        opt = vis.get_render_option()
-        opt.background_color = np.asarray([0, 0, 0])
-        opt.point_size = 1.0
+    fig, ax = plt.subplots(figsize=(10, 10), facecolor='black')
+    ax.set_facecolor('black')
 
-        vis.add_geometry(pcd)
-        for ele in pred:
-            vis.add_geometry(ele)
-        for ele in gt:
-            vis.add_geometry(ele)
+    # 2. Render LiDAR Point Cloud Background
+    if pcd is not None and len(pcd) > 0:
+        # Filter points within BEV ROI (-40m to +40m)
+        mask = (np.abs(pcd[:, 0]) < 40) & (np.abs(pcd[:, 1]) < 40)
+        pts = pcd[mask]
+        ax.scatter(pts[:, 0], pts[:, 1], s=0.2, c='white', alpha=0.5)
 
-        vis.run()
-        vis.destroy_window()
+    # Helper function to plot 3D box corners on 2D BEV plane
+    def draw_bev_boxes(ax, box_tensor, color, label):
+        if box_tensor is None or len(box_tensor) == 0:
+            return
 
-    origin_lidar = pcd
-    if not isinstance(pcd, np.ndarray):
-        origin_lidar = common_utils.torch_tensor_to_numpy(pcd)
+        # Handle center-format boxes [x, y, z, dx, dy, dz, yaw]
+        if len(box_tensor.shape) == 2 and box_tensor.shape[1] == 7:
+            box_corners = box_utils.boxes_to_corners_3d(box_tensor, order='hwl')
+        else:
+            box_corners = box_tensor  # Corner format (N, 8, 3)
 
-    origin_lidar_intcolor = \
-        color_encoding(origin_lidar[:, -1] if mode == 'intensity'
-                       else origin_lidar[:, 2], mode=mode)
-    # left -> right hand
-    origin_lidar[:, :1] = -origin_lidar[:, :1]
+        for i in range(box_corners.shape[0]):
+            corners_2d = box_corners[i, :4, :2]  # Extract 2D BEV footprint
+            try:
+                hull = ConvexHull(corners_2d)
+                ordered_corners = corners_2d[hull.vertices]
+            except Exception:
+                ordered_corners = corners_2d
 
-    o3d_pcd = o3d.geometry.PointCloud()
-    o3d_pcd.points = o3d.utility.Vector3dVector(origin_lidar[:, :3])
-    o3d_pcd.colors = o3d.utility.Vector3dVector(origin_lidar_intcolor)
+            polygon = patches.Polygon(
+                ordered_corners,
+                closed=True,
+                edgecolor=color,
+                facecolor='none',
+                linewidth=1.8,
+                label=label if i == 0 else ""
+            )
+            ax.add_patch(polygon)
 
-    oabbs_pred = bbx2oabb(pred_tensor, color=(1, 0, 0))
-    oabbs_gt = bbx2oabb(gt_tensor, color=(0, 1, 0))
+    # 3. Draw Ground Truth Bounding Boxes (GREEN)
+    draw_bev_boxes(ax, gt_tensor, color='#00FF00', label='Ground Truth')
 
-    visualize_elements = [o3d_pcd] + oabbs_pred + oabbs_gt
-    if show_vis:
-        custom_draw_geometry(o3d_pcd, oabbs_pred, oabbs_gt)
+    # 4. Draw Model Predicted Bounding Boxes (RED)
+    draw_bev_boxes(ax, pred_tensor, color='#FF0000', label='Prediction')
+
+    # 5. Format Viewport Bounds
+    ax.set_xlim(-35, 35)
+    ax.set_ylim(-35, 35)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    # Add Legend
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles=handles, labels=labels, loc='upper right',
+                  facecolor='#111111', edgecolor='white', labelcolor='white', fontsize=10)
+
+    plt.tight_layout()
+
+    # Save rendered figure
     if save_path:
-        save_o3d_visualization(visualize_elements, save_path)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='black')
+    if show_vis:
+        plt.show()
 
+    plt.close(fig)
 
 def visualize_sequence_sample_output(pred_tensor_list,
                                      gt_tensor_list,
@@ -619,15 +658,40 @@ def save_o3d_visualization(element, save_path):
     save_path : str
         The save path.
     """
+    import open3d as o3d
+    import numpy as np
+
+    print("this method called")
+
     vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    for i in range(len(element)):
-        vis.add_geometry(element[i])
-        vis.update_geometry(element[i])
+    
+    # 1. MUST set visible=True so GLFW allocates the virtual frame buffer inside Xvfb
+    vis.create_window(visible=True, width=1280, height=720)
 
-    vis.poll_events()
-    vis.update_renderer()
+    # 2. Add geometries
+    for item in element:
+        vis.add_geometry(item)
 
+    # 3. Configure render options for contrast
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0.15, 0.15, 0.15])  # Dark grey background
+    opt.point_size = 3.0                                  # Thicker point cloud rendering
+
+    # 4. Auto-center camera around the LiDAR point cloud extent
+    vis.reset_view_point(True)
+
+    # 5. Set explicit Bird's-Eye View (BEV) perspective
+    ctr = vis.get_view_control()
+    ctr.set_front([0.0, 0.0, 1.0])
+    ctr.set_up([0.0, 1.0, 0.0])
+    ctr.set_zoom(0.35)
+
+    # 6. Cycle event loop 30 times to force OpenGL buffer swap under Xvfb
+    for _ in range(30):
+        vis.poll_events()
+        vis.update_renderer()
+
+    # 7. Capture frame to disk
     vis.capture_screen_image(save_path)
     vis.destroy_window()
 

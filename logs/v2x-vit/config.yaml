@@ -202,7 +202,7 @@ train_params:
   max_cav: 5
   save_freq: 1
 # validate_dir: 'v2xset/test' # Actual location 
-validate_dir: 'v2xset/test_truncated'   # Custom location
+validate_dir: 'v2xset/test_single'   # Custom location
 wild_setting:
   async: false # earelier it was flase
   async_mode: 'sim'
@@ -210,8 +210,8 @@ wild_setting:
   backbone_delay: 10
   data_size: 1.06
   loc_err: true # earlier it was false
-  ryp_std: 0
+  ryp_std: 1
   seed: 25
   transmission_speed: 27
-  xyz_std: 0.2
+  xyz_std: 1
 yaml_parser: load_point_pillar_params
