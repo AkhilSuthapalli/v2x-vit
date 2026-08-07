@@ -295,7 +295,9 @@ def visualize_single_sample_output_gt(pred_tensor,
     origin_lidar_intcolor = \
         color_encoding(origin_lidar[:, -1] if mode == 'intensity'
                        else origin_lidar[:, 2], mode=mode)
-    # left -> right hand
+    
+    # Create copy to prevent modifying input in-place repeatedly
+    origin_lidar = origin_lidar.copy()
     origin_lidar[:, :1] = -origin_lidar[:, :1]
 
     o3d_pcd = o3d.geometry.PointCloud()
@@ -306,11 +308,11 @@ def visualize_single_sample_output_gt(pred_tensor,
     oabbs_gt = bbx2oabb(gt_tensor, color=(0, 1, 0))
 
     visualize_elements = [o3d_pcd] + oabbs_pred + oabbs_gt
+
     if show_vis:
         custom_draw_geometry(o3d_pcd, oabbs_pred, oabbs_gt)
     if save_path:
         save_o3d_visualization(visualize_elements, save_path)
-
 
 def visualize_sequence_sample_output(pred_tensor_list,
                                      gt_tensor_list,
@@ -619,15 +621,29 @@ def save_o3d_visualization(element, save_path):
     save_path : str
         The save path.
     """
+    import time
     vis = o3d.visualization.Visualizer()
-    vis.create_window()
+    # 1. Create window with explicit offscreen visibility settings
+    vis.create_window(visible=False, width=1280, height=720)
+
+    # 2. Add geometries and set render options
     for i in range(len(element)):
         vis.add_geometry(element[i])
         vis.update_geometry(element[i])
 
-    vis.poll_events()
-    vis.update_renderer()
+    opt = vis.get_render_option()
+    opt.background_color = np.array([0.1, 0.1, 0.1])  # Dark grey background
+    opt.point_size = 2.0                               # Increase point thickness
 
+    # 3. Recalculate camera position to encapsulate point cloud bounding box
+    vis.reset_view_point_cameras()
+
+    # 4. Cycle renderer multiple times to allow OpenGL frame buffer to swap
+    for _ in range(10):
+        vis.poll_events()
+        vis.update_renderer()
+
+    # 5. Capture rendered image
     vis.capture_screen_image(save_path)
     vis.destroy_window()
 
