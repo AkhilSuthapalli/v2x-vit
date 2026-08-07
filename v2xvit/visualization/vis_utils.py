@@ -621,24 +621,40 @@ def save_o3d_visualization(element, save_path):
     save_path : str
         The save path.
     """
+    import open3d as o3d
+    import numpy as np
+
+    print("this method called")
+
     vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False, width=1280, height=720)
+    
+    # 1. MUST set visible=True so GLFW allocates the virtual frame buffer inside Xvfb
+    vis.create_window(visible=True, width=1280, height=720)
 
-    for i in range(len(element)):
-        vis.add_geometry(element[i])
+    # 2. Add geometries
+    for item in element:
+        vis.add_geometry(item)
 
+    # 3. Configure render options for contrast
     opt = vis.get_render_option()
-    opt.background_color = np.array([0.1, 0.1, 0.1])  # Dark grey background
-    opt.point_size = 2.0                               # Thicker points for visibility
+    opt.background_color = np.array([0.15, 0.15, 0.15])  # Dark grey background
+    opt.point_size = 3.0                                  # Thicker point cloud rendering
 
-    # Correct Open3D method to auto-center camera on point cloud extent
+    # 4. Auto-center camera around the LiDAR point cloud extent
     vis.reset_view_point(True)
 
-    # Cycle renderer buffer so virtual display (xvfb) captures geometry
-    for _ in range(10):
+    # 5. Set explicit Bird's-Eye View (BEV) perspective
+    ctr = vis.get_view_control()
+    ctr.set_front([0.0, 0.0, 1.0])
+    ctr.set_up([0.0, 1.0, 0.0])
+    ctr.set_zoom(0.35)
+
+    # 6. Cycle event loop 30 times to force OpenGL buffer swap under Xvfb
+    for _ in range(30):
         vis.poll_events()
         vis.update_renderer()
 
+    # 7. Capture frame to disk
     vis.capture_screen_image(save_path)
     vis.destroy_window()
 
