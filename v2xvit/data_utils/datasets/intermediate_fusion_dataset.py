@@ -16,6 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
+from v2xvit.utils.spatial_aligner import CentroidConsensusAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -28,6 +29,8 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             params['postprocess'],
             train)
 
+        self.aligner = CentroidConsensusAligner(method="svd", max_match_dist=4.0, deadband_thresh=0.35)
+
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
         # between  the time when the LiDAR data is captured by connected
@@ -36,6 +39,67 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         base_data_dict = \
             self.retrieve_base_data(idx,
                                     cur_ego_pose_flag=self.cur_ego_pose_flag)
+
+        # =========================================================================
+        # --- FIXED SPATIAL ALIGNMENT HOOK (CORRECT LOCAL COORDINATES) ---
+        # =========================================================================
+        if hasattr(self, 'aligner') and self.aligner is not None:
+            # Helper: Uses V2X-ViT post_processor to get local 3D bounding boxes
+            def _get_local_boxes(cav_dict):
+                if not isinstance(cav_dict, dict) or 'params' not in cav_dict:
+                    return None
+                lidar_pose = cav_dict['params']['lidar_pose']
+                # Generate 3D box centers in this CAV's local LiDAR coordinate frame
+                object_bbx_center, object_bbx_mask, _ = \
+                    self.post_processor.generate_object_center([cav_dict], lidar_pose)
+                valid_boxes = object_bbx_center[object_bbx_mask == 1]
+                return valid_boxes if len(valid_boxes) > 0 else None
+
+            # 1. Identify Ego CAV ID
+            ego_id = None
+            for cav_id, cav_content in base_data_dict.items():
+                if isinstance(cav_content, dict):
+                    if cav_content.get('ego', False) is True:
+                        ego_id = cav_id
+                        break
+                    if 'params' in cav_content and 'transformation_matrix' in cav_content['params']:
+                        if np.allclose(cav_content['params']['transformation_matrix'], np.eye(4), atol=1e-3):
+                            ego_id = cav_id
+                            break
+
+            if ego_id is None and len(base_data_dict) > 0:
+                ego_id = list(base_data_dict.keys())[0]
+
+            # 2. Extract Ego Local Boxes and align Sender CAV matrices
+            if ego_id is not None and ego_id in base_data_dict:
+                ego_boxes_local = _get_local_boxes(base_data_dict[ego_id])
+
+                for cav_id, cav_content in base_data_dict.items():
+                    if cav_id == ego_id or not isinstance(cav_content, dict):
+                        continue
+                    if 'params' not in cav_content or 'transformation_matrix' not in cav_content['params']:
+                        continue
+
+                    sender_boxes_local = _get_local_boxes(cav_content)
+                    noisy_T = cav_content['params']['transformation_matrix'].copy()
+
+                    if ego_boxes_local is not None and sender_boxes_local is not None:
+                        # Apply Centroid Alignment on Local-to-Local coordinates
+                        corrected_T = self.aligner.correct_pose_matrix(
+                            T_noisy=noisy_T,
+                            ego_boxes=ego_boxes_local,
+                            sender_boxes=sender_boxes_local
+                        )
+
+                        matrix_changed = not np.allclose(noisy_T, corrected_T)
+                        print(f"[ALIGNMENT CHECK] CAV '{cav_id}' | Corrected?: {matrix_changed}")
+                        if matrix_changed:
+                            print(f"   Noisy  Shift (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
+                            print(f"   Fixed  Shift (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
+
+                        # Overwrite transformation matrix
+                        base_data_dict[cav_id]['params']['transformation_matrix'] = corrected_T
+        # =========================================================================
 
         processed_data_dict = OrderedDict()
         processed_data_dict['ego'] = {}
