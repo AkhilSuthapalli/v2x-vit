@@ -415,8 +415,22 @@ class VoxelPostprocessor(BasePostprocessor):
             opencood dataset object.
 
         """
-        vis_utils.visualize_single_sample_output_gt(pred_box_tensor,
-                                                    gt_tensor,
-                                                    pcd,
-                                                    show_vis,
-                                                    save_path)
+        if dataset is not None:
+            # Uses OpenCOOD's built-in 2D BEV projector
+            vis_utils.visualize_single_sample_output_bev(
+                pred_box_tensor,
+                gt_tensor,
+                pcd,
+                dataset,
+                show_vis=show_vis,
+                save_path=save_path
+            )
+        else:
+            # Fallback to 3D output
+            vis_utils.visualize_single_sample_output_gt(
+                pred_box_tensor,
+                gt_tensor,
+                pcd,
+                show_vis,
+                save_path
+            )
