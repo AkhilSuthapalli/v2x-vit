@@ -114,15 +114,18 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                         T_init = selected_cav_base['params']['transformation_matrix']
                         sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Retrieve GT noise matrix if available in base dict
-                        T_gt_noise = selected_cav_base['params'].get('spatial_correction_matrix', None)
+                        # Extract TRUE noise matrix for diagnostic logging
+                        T_gt_noise = None
+                        if 'clean_transformation_matrix' in selected_cav_base['params']:
+                            T_clean = selected_cav_base['params']['clean_transformation_matrix']
+                            T_gt_noise = T_init @ np.linalg.inv(T_clean)
                         
-                        # Run Instrumented Alignment with GT Noise comparison
+                        # Run High-Precision Alignment
                         T_corr, (dx, dy, dtheta) = self.aligner.align(
                             ego_boxes_ref, sender_boxes_ego_frame, T_gt_noise=T_gt_noise
                         )
                         
-                        # Update transformation matrices
+                        # Apply correction
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
                         selected_cav_base['params']['spatial_correction_matrix'] = \
