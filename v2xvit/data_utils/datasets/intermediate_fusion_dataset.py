@@ -16,7 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-from v2xvit.utils.alignment_corner_icp import RobustCornerICPAligner
+from v2xvit.utils.alignment_corner_icp import CornerICPAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -26,7 +26,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'], train)
 
-        self.aligner = RobustCornerICPAligner(
+        self.aligner = CornerICPAligner(
             max_match_dist=2.5, 
             min_boxes_required=2, 
             max_residual_err=1.0
@@ -74,26 +74,28 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         ego_boxes_ref = ego_processed_ref.get('object_bbx_center', np.array([]))
 
         # 4. Approach 3 Alignment Hook
-        for cav_id, selected_cav_base in base_data_dict.items():
-            distance = math.sqrt(
-                (selected_cav_base['params']['lidar_pose'][0] - ego_lidar_pose[0]) ** 2 +
-                (selected_cav_base['params']['lidar_pose'][1] - ego_lidar_pose[1]) ** 2
-            )
-            if distance > v2xvit.data_utils.datasets.COM_RANGE:
-                continue
-
-            if cav_id != ego_id and len(ego_boxes_ref) >= 2:
+        if cav_id != ego_id and len(ego_boxes_ref) >= 2:
                 sender_processed_noisy, void_check = self.get_item_single_car(
-                    selected_cav_base, ego_lidar_pose)
+                    selected_cav_base, ego_lidar_pose
+                )
                 
                 if not void_check:
                     sender_boxes_noisy = sender_processed_noisy.get('object_bbx_center', np.array([]))
                     
                     if len(sender_boxes_noisy) >= 2:
-                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        # Extract Ground-Truth noise matrix for diagnostic logging
+                        T_gt_noise = None
+                        if 'clean_transformation_matrix' in selected_cav_base['params']:
+                            T_init = selected_cav_base['params']['transformation_matrix']
+                            T_clean = selected_cav_base['params']['clean_transformation_matrix']
+                            T_gt_noise = T_init @ np.linalg.inv(T_clean)
+
+                        # Run Instrumented Alignment
+                        T_corr, (dx, dy, dtheta) = self.aligner.align(
+                            ego_boxes_ref, sender_boxes_noisy, T_gt_noise=T_gt_noise
+                        )
                         
-                        # FIX: Apply T_corr ONLY to transformation_matrix for point cloud projection.
-                        # Do NOT pre-multiply spatial_correction_matrix to prevent 2x feature warping on GPU.
+                        # Apply T_corr ONLY to transformation_matrix for point cloud projection
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
 
