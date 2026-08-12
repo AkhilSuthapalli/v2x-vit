@@ -103,24 +103,22 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     selected_cav_base, ego_lidar_pose)
                 
                 if not void_check:
-                    sender_boxes_noisy = sender_processed_noisy['object_bbx_center']
+                    sender_boxes_local = sender_processed_noisy['object_bbx_center']
                     
-                    if len(sender_boxes_noisy) > 0:
-                        T_orig_trans = selected_cav_base['params']['transformation_matrix'].copy()
+                    if len(sender_boxes_local) > 0:
+                        T_init = selected_cav_base['params']['transformation_matrix']
                         
-                        # Execute Alignment
-                        T_corr, (dx, dy, dtheta) = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        # FIX: Project sender boxes into Ego frame first
+                        sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Apply correction
+                        # Run Nelder-Mead alignment in Ego coordinate space
+                        T_corr, (dx, dy, dtheta) = self.aligner.align(ego_boxes_ref, sender_boxes_ego_frame)
+                        
+                        # Apply solved delta correction to transformation matrices
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
                         selected_cav_base['params']['spatial_correction_matrix'] = \
                             T_corr @ selected_cav_base['params']['spatial_correction_matrix']
-
-                        # DEBUG CHECKPOINT 4: Matrix modification verification
-                        print(f"\n[DEBUG DATASET] CAV ID: {cav_id}")
-                        print(f"[DEBUG DATASET] Original T_trans translation: {T_orig_trans[:2, 3]}")
-                        print(f"[DEBUG DATASET] Corrected T_trans translation: {selected_cav_base['params']['transformation_matrix'][:2, 3]}")
 
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base,
@@ -199,6 +197,24 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 np.vstack(
                     projected_lidar_stack)})
         return processed_data_dict
+
+    def transform_boxes_to_ego(boxes, T):
+        """Transforms bounding boxes from CAV local frame to Ego frame using T matrix."""
+        if len(boxes) == 0:
+            return boxes
+        transformed = boxes.copy()
+        
+        # 1. Rotate and translate center coordinates (x, y)
+        R = T[:2, :2]
+        t = T[:2, 3]
+        transformed[:, :2] = transformed[:, :2] @ R.T + t
+        
+        # 2. Add heading/yaw angle offset
+        yaw_offset = np.arctan2(T[1, 0], T[0, 0])
+        yaw_idx = 6 if transformed.shape[1] > 6 else 4
+        transformed[:, yaw_idx] += yaw_offset
+        
+        return transformed
 
     @staticmethod
     def get_pairwise_transformation(base_data_dict, max_cav):
