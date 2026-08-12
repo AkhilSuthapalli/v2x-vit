@@ -46,8 +46,13 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 ego_key = cav_id
                 break
 
-        if ego_key is not None and list(base_data_dict.keys())[0] != ego_key:
-            base_data_dict.move_to_end(ego_key, last=False)
+        if ego_key is not None:
+            reordered_dict = OrderedDict()
+            reordered_dict[ego_key] = base_data_dict[ego_key]
+            for cav_id, cav_content in base_data_dict.items():
+                if cav_id != ego_key:
+                    reordered_dict[cav_id] = cav_content
+            base_data_dict = reordered_dict
 
         processed_data_dict = OrderedDict()
         processed_data_dict['ego'] = {}
