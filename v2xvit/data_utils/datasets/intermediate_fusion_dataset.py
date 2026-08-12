@@ -16,7 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-from v2xvit.utils.alignment_iou import ConsensusDIoUAligner
+from v2xvit.utils.alignment_iou import DiagnosticDIoUAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -28,11 +28,11 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
-        self.aligner = ConsensusDIoUAligner(
+        self.aligner = DiagnosticDIoUAligner(
             max_trans_bound=2.0,
             max_yaw_bound=np.radians(8.0),
-            consensus_radius=1.5,
-            min_consensus_pairs=2
+            # consensus_radius=1.5,
+            # min_consensus_pairs=2
             )   
 
     def __getitem__(self, idx):
