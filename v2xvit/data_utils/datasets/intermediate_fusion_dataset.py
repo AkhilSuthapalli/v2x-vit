@@ -16,6 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
+from v2xvit.utils.alignment_corner_icp import CornerICPAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -27,6 +28,8 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
+
+        self.aligner = CornerICPAligner(max_match_dist=5.0, min_boxes_required=2)
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
@@ -49,6 +52,49 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 ego_id = cav_id
                 ego_lidar_pose = cav_content['params']['lidar_pose']
                 break
+
+        # -----------------------------------------------------------------
+        # 3. EXTRACT EGO PROPOSALS AS ANCHOR REFERENCE:
+        # -----------------------------------------------------------------
+        ego_cav_base = base_data_dict[ego_id]
+        ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
+        ego_boxes_ref = ego_processed_ref.get('object_bbx_center', np.array([]))
+
+        # Loop over all CAVs to process information
+        for cav_id, selected_cav_base in base_data_dict.items():
+            distance = math.sqrt(
+                (selected_cav_base['params']['lidar_pose'][0] - ego_lidar_pose[0]) ** 2 +
+                (selected_cav_base['params']['lidar_pose'][1] - ego_lidar_pose[1]) ** 2
+            )
+            if distance > v2xvit.data_utils.datasets.COM_RANGE:
+                continue
+
+            # -------------------------------------------------------------
+            # 4. HOOK APPROACH 3 ALIGNMENT LOGIC BEFORE FEATURE WARPING:
+            # -------------------------------------------------------------
+            if cav_id != ego_id and len(ego_boxes_ref) >= 2:
+                sender_processed_noisy, void_check = self.get_item_single_car(selected_cav_base, ego_lidar_pose)
+                
+                if not void_check:
+                    sender_boxes_noisy = sender_processed_noisy.get('object_bbx_center', np.array([]))
+                    
+                    if len(sender_boxes_noisy) >= 2:
+                        # Compute SE(3) transformation matrix T_corr using Corner SVD
+                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        
+                        # Apply correction to both transformation matrices
+                        selected_cav_base['params']['transformation_matrix'] = \
+                            T_corr @ selected_cav_base['params']['transformation_matrix']
+                        selected_cav_base['params']['spatial_correction_matrix'] = \
+                            T_corr @ selected_cav_base['params']['spatial_correction_matrix']
+
+            selected_cav_processed, void_lidar = self.get_item_single_car(
+                selected_cav_base,
+                ego_lidar_pose
+            )
+
+
+
         assert cav_id == list(base_data_dict.keys())[
             0], "The first element in the OrderedDict must be ego"
         assert ego_id != -1
