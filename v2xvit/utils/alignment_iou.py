@@ -2,13 +2,14 @@ import numpy as np
 
 class RobustVectorizedDIoUAligner:
     """
-    Approach 2: Instrumented OBB DIoU Aligner with Detailed Diagnostics
-    Prints line-by-line execution states to isolate accuracy drops.
+    Approach 2: Relative-Gain Gated OBB DIoU Aligner
+    Uses relative quality gain (final_quality > init_quality) and expanded search radii
+    to prevent over-rejection and ensure high AP recovery.
     """
-    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(10.0), min_match_score=0.35, debug=True):
+    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0), min_quality_gain=0.03, debug=True):
         self.max_trans_bound = max_trans_bound
         self.max_yaw_bound = max_yaw_bound
-        self.min_match_score = min_match_score
+        self.min_quality_gain = min_quality_gain  # Accepts correction if quality improves by >= 0.03
         self.debug = debug
 
     @staticmethod
@@ -38,7 +39,7 @@ class RobustVectorizedDIoUAligner:
         return rotated + centers
 
     def _compute_obb_diou_cost(self, ego_boxes, shifted_sender_boxes):
-        """Calculates exact OBB Chamfer-DIoU distance and match quality."""
+        """Calculates softened OBB distance score and match quality."""
         s_centers = shifted_sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
         centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
@@ -54,8 +55,9 @@ class RobustVectorizedDIoUAligner:
         obb_dists = centroid_dists + 0.5 * corner_dists
         best_matches = np.min(obb_dists, axis=1)
 
-        similarity_score = np.sum(1.0 / (1.0 + best_matches))
-        quality = np.mean(1.0 / (1.0 + best_matches))
+        # Softened distance metric: 1 / (1 + dist/2.0)
+        similarity_score = np.sum(1.0 / (1.0 + best_matches / 2.0))
+        quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
 
         return -similarity_score, quality
 
@@ -90,33 +92,31 @@ class RobustVectorizedDIoUAligner:
         return best_delta, best_quality
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
-        """Performs 2-Pass OBB DIoU Grid Search with detailed diagnostic prints."""
+        """Performs 2-Pass OBB DIoU Grid Search with Relative Quality Gain Gating."""
         if self.debug:
             print(f"\n[DEBUG ALIGNER] Input Box Counts -> Ego: {len(ego_boxes)}, Sender (Ego Frame): {len(sender_boxes_ego_frame)}")
 
-        # 1. Box Count Check
-        if len(ego_boxes) < 2 or len(sender_boxes_ego_frame) < 2:
+        # 1. Require at least 1 box in both frames
+        if len(ego_boxes) < 1 or len(sender_boxes_ego_frame) < 1:
             if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED: Less than 2 boxes (Ego: {len(ego_boxes)}, Sender: {len(sender_boxes_ego_frame)}). Returning Identity.")
+                print(f"[DEBUG ALIGNER] -> REJECTED: Empty box set. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # 2. Distance Pre-filtering
+        # 2. Expanded Distance Pre-filtering (8.0m radius to handle 8 deg heading shift at range)
         candidate_sender = []
         for s_box in sender_boxes_ego_frame:
             dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
-            if np.min(dists) <= 6.0:
+            if np.min(dists) <= 8.0:
                 candidate_sender.append(s_box)
 
-        if len(candidate_sender) < 2:
+        if len(candidate_sender) < 1:
             if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED: Only {len(candidate_sender)} sender boxes within 6.0m radius of Ego boxes. Returning Identity.")
+                print(f"[DEBUG ALIGNER] -> REJECTED: 0 sender boxes within 8.0m radius. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         candidate_sender = np.array(candidate_sender)
-        if self.debug:
-            print(f"[DEBUG ALIGNER] Candidate Pairs Filtered: {len(candidate_sender)} sender boxes passed 6.0m radius check.")
 
-        # Initial baseline quality at (0, 0, 0)
+        # Baseline quality at current state (0, 0, 0)
         _, init_quality = self._compute_obb_diou_cost(ego_boxes, candidate_sender)
 
         # 3. Pass 1: Coarse Grid Search
@@ -137,14 +137,16 @@ class RobustVectorizedDIoUAligner:
             ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
         )
 
-        if self.debug:
-            print(f"[DEBUG ALIGNER] Quality Scores -> Initial: {init_quality:.4f} | Coarse: {coarse_quality:.4f} | Final: {final_quality:.4f}")
-            print(f"[DEBUG ALIGNER] Candidate Delta -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
+        quality_gain = final_quality - init_quality
 
-        # 5. Quality Match Gate Check
-        if final_quality < self.min_match_score:
+        if self.debug:
+            print(f"[DEBUG ALIGNER] Quality -> Initial: {init_quality:.4f} | Final: {final_quality:.4f} | Gain: +{quality_gain:.4f}")
+            print(f"[DEBUG ALIGNER] Delta -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
+
+        # 5. Relative Gain Check (Accept if optimization improved alignment quality)
+        if quality_gain < self.min_quality_gain:
             if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED BY GATE: Final Quality ({final_quality:.4f}) < Threshold ({self.min_match_score:.4f}). Returning Identity.")
+                print(f"[DEBUG ALIGNER] -> REJECTED: Quality gain (+{quality_gain:.4f}) < Threshold (+{self.min_quality_gain:.4f}). Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         # 6. Deadband Threshold Check
