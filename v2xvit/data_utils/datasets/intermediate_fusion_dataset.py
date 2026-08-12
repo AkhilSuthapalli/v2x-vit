@@ -111,14 +111,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     
                     if len(sender_boxes_local) > 0:
                         T_init = selected_cav_base['params']['transformation_matrix']
-                        
-                        # FIX: Project sender boxes into Ego frame first
                         sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Run Nelder-Mead alignment in Ego coordinate space
+                        # Run Instrumented Alignment
                         T_corr, (dx, dy, dtheta) = self.aligner.align(ego_boxes_ref, sender_boxes_ego_frame)
                         
-                        # Apply solved delta correction to transformation matrices
+                        # Update transformation matrices
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
                         selected_cav_base['params']['spatial_correction_matrix'] = \

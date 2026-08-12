@@ -2,21 +2,18 @@ import numpy as np
 
 class RobustVectorizedDIoUAligner:
     """
-    Upgraded Approach 2: Oriented Bounding Box (OBB) DIoU Grid Aligner
-    Uses exact 2D rotated corner distance matching, proposal quality filtering,
-    and confidence gating to prevent accuracy degradation.
+    Approach 2: Instrumented OBB DIoU Aligner with Detailed Diagnostics
+    Prints line-by-line execution states to isolate accuracy drops.
     """
-    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(10.0), min_match_score=0.35):
-        self.max_trans_bound = max_trans_bound  # +/- 2.0m translation limit
-        self.max_yaw_bound = max_yaw_bound      # +/- 10.0 deg heading limit
-        self.min_match_score = min_match_score  # Gate threshold to apply correction
+    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(10.0), min_match_score=0.35, debug=True):
+        self.max_trans_bound = max_trans_bound
+        self.max_yaw_bound = max_yaw_bound
+        self.min_match_score = min_match_score
+        self.debug = debug
 
     @staticmethod
     def _get_2d_corners_batch(boxes):
-        """
-        Vectorized conversion of (N, 7) boxes [x, y, z, dx, dy, dz, yaw] 
-        into 4 oriented 2D corner points (N, 4, 2).
-        """
+        """Vectorized conversion of (N, 7) boxes into 4 oriented 2D corner points (N, 4, 2)."""
         N = len(boxes)
         x, y = boxes[:, 0], boxes[:, 1]
         length, width = boxes[:, 3], boxes[:, 4]
@@ -24,7 +21,6 @@ class RobustVectorizedDIoUAligner:
 
         l2, w2 = length / 2.0, width / 2.0
 
-        # Unrotated corners centered at origin (4, 2)
         base_corners = np.array([
             [-1, -1],
             [ 1, -1],
@@ -32,49 +28,36 @@ class RobustVectorizedDIoUAligner:
             [-1,  1]
         ], dtype=np.float32)
 
-        # Scale corners by length and width -> (N, 4, 2)
         scaled_corners = base_corners[None, :, :] * np.stack([l2, w2], axis=-1)[:, None, :]
-
-        # Rotate and translate
         c, s = np.cos(yaw), np.sin(yaw)
-        R = np.stack([c, -s, s, c], axis=-1).reshape(N, 2, 2)  # (N, 2, 2)
+        R = np.stack([c, -s, s, c], axis=-1).reshape(N, 2, 2)
 
-        rotated = np.matmul(scaled_corners, R.transpose(0, 2, 1))  # (N, 4, 2)
-        centers = np.stack([x, y], axis=-1)[:, None, :]           # (N, 1, 2)
+        rotated = np.matmul(scaled_corners, R.transpose(0, 2, 1))
+        centers = np.stack([x, y], axis=-1)[:, None, :]
 
-        return rotated + centers  # (N, 4, 2)
+        return rotated + centers
 
     def _compute_obb_diou_cost(self, ego_boxes, shifted_sender_boxes):
-        """
-        Calculates exact Oriented Bounding Box (OBB) Chamfer-DIoU distance.
-        """
-        num_s = len(shifted_sender_boxes)
-        num_e = len(ego_boxes)
-
-        # 1. Centroid Distances (N, M)
+        """Calculates exact OBB Chamfer-DIoU distance and match quality."""
         s_centers = shifted_sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
         centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
 
-        # 2. Rotated Corner Distance Matching (N, M)
-        s_corners = self._get_2d_corners_batch(shifted_sender_boxes)  # (N, 4, 2)
-        e_corners = self._get_2d_corners_batch(ego_boxes)             # (M, 4, 2)
+        s_corners = self._get_2d_corners_batch(shifted_sender_boxes)
+        e_corners = self._get_2d_corners_batch(ego_boxes)
 
-        # Mean Euclidean distance between 4 box corners (N, M)
         corner_dists = np.mean(
             np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1),
             axis=-1
         )
 
-        # Total combined OBB distance score
         obb_dists = centroid_dists + 0.5 * corner_dists
-
-        # For each sender box, select closest ego box
         best_matches = np.min(obb_dists, axis=1)
 
-        # Convert distance to similarity score (higher is better)
         similarity_score = np.sum(1.0 / (1.0 + best_matches))
-        return -similarity_score, np.mean(1.0 / (1.0 + best_matches))
+        quality = np.mean(1.0 / (1.0 + best_matches))
+
+        return -similarity_score, quality
 
     def _transform_boxes(self, boxes, dx, dy, dtheta):
         """Applies (dx, dy, dtheta) offset to sender bounding boxes."""
@@ -107,14 +90,17 @@ class RobustVectorizedDIoUAligner:
         return best_delta, best_quality
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
-        """
-        Performs 2-Pass Coarse-to-Fine OBB DIoU Grid Search with Quality Gate.
-        """
-        # REQUIREMENT 1: Must have at least 2 boxes in both views for reliable geometric matching
+        """Performs 2-Pass OBB DIoU Grid Search with detailed diagnostic prints."""
+        if self.debug:
+            print(f"\n[DEBUG ALIGNER] Input Box Counts -> Ego: {len(ego_boxes)}, Sender (Ego Frame): {len(sender_boxes_ego_frame)}")
+
+        # 1. Box Count Check
         if len(ego_boxes) < 2 or len(sender_boxes_ego_frame) < 2:
+            if self.debug:
+                print(f"[DEBUG ALIGNER] -> REJECTED: Less than 2 boxes (Ego: {len(ego_boxes)}, Sender: {len(sender_boxes_ego_frame)}). Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # Pre-filter candidate sender boxes within 6.0m search neighborhood
+        # 2. Distance Pre-filtering
         candidate_sender = []
         for s_box in sender_boxes_ego_frame:
             dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
@@ -122,11 +108,18 @@ class RobustVectorizedDIoUAligner:
                 candidate_sender.append(s_box)
 
         if len(candidate_sender) < 2:
+            if self.debug:
+                print(f"[DEBUG ALIGNER] -> REJECTED: Only {len(candidate_sender)} sender boxes within 6.0m radius of Ego boxes. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         candidate_sender = np.array(candidate_sender)
+        if self.debug:
+            print(f"[DEBUG ALIGNER] Candidate Pairs Filtered: {len(candidate_sender)} sender boxes passed 6.0m radius check.")
 
-        # Pass 1: Coarse Grid Search (+/- 1.5m translation, +/- 8 deg heading)
+        # Initial baseline quality at (0, 0, 0)
+        _, init_quality = self._compute_obb_diou_cost(ego_boxes, candidate_sender)
+
+        # 3. Pass 1: Coarse Grid Search
         coarse_x = np.linspace(-1.5, 1.5, 5)
         coarse_y = np.linspace(-1.5, 1.5, 5)
         coarse_yaw = np.linspace(-np.radians(8.0), np.radians(8.0), 5)
@@ -135,7 +128,7 @@ class RobustVectorizedDIoUAligner:
             ego_boxes, candidate_sender, coarse_x, coarse_y, coarse_yaw
         )
 
-        # Pass 2: Fine Grid Search around Coarse Seed (+/- 0.3m, +/- 2 deg)
+        # 4. Pass 2: Fine Grid Search
         fine_x = np.linspace(c_dx - 0.3, c_dx + 0.3, 5)
         fine_y = np.linspace(c_dy - 0.3, c_dy + 0.3, 5)
         fine_yaw = np.linspace(c_yaw - np.radians(2.0), c_yaw + np.radians(2.0), 5)
@@ -144,15 +137,25 @@ class RobustVectorizedDIoUAligner:
             ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
         )
 
-        # REQUIREMENT 2: Quality Match Gate (Reject correction if similarity is low)
+        if self.debug:
+            print(f"[DEBUG ALIGNER] Quality Scores -> Initial: {init_quality:.4f} | Coarse: {coarse_quality:.4f} | Final: {final_quality:.4f}")
+            print(f"[DEBUG ALIGNER] Candidate Delta -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
+
+        # 5. Quality Match Gate Check
         if final_quality < self.min_match_score:
+            if self.debug:
+                print(f"[DEBUG ALIGNER] -> REJECTED BY GATE: Final Quality ({final_quality:.4f}) < Threshold ({self.min_match_score:.4f}). Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # REQUIREMENT 3: Deadband Thresholding (Ignore sub-5cm micro-adjustments)
+        # 6. Deadband Threshold Check
         if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(opt_dtheta) < np.radians(0.3):
+            if self.debug:
+                print(f"[DEBUG ALIGNER] -> REJECTED BY DEADBAND: Sub-5cm / Sub-0.3deg adjustment. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # Construct SE(3) Homogeneous Matrix
+        if self.debug:
+            print(f"[DEBUG ALIGNER] -> ACCEPTED: Applying T_corr [dx={opt_dx:.3f}m, dy={opt_dy:.3f}m, yaw={np.degrees(opt_dtheta):.2f}°]")
+
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
         T_corr = np.eye(4)
         T_corr[0, 0], T_corr[0, 1] = c, -s
