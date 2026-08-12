@@ -78,6 +78,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 sender_processed_noisy, void_check = self.get_item_single_car(
                     selected_cav_base, ego_lidar_pose
                 )
+                print("Alignment hook active")
                 
                 if not void_check:
                     sender_boxes_noisy = sender_processed_noisy.get('object_bbx_center', np.array([]))
@@ -91,6 +92,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                             T_gt_noise = T_init @ np.linalg.inv(T_clean)
 
                         # Run Instrumented Alignment
+                        print("Alignment hook active 2")
                         T_corr, (dx, dy, dtheta) = self.aligner.align(
                             ego_boxes_ref, sender_boxes_noisy, T_gt_noise=T_gt_noise
                         )
