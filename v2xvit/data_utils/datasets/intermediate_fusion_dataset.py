@@ -29,9 +29,10 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             params['postprocess'],
             train)
         self.aligner = RobustVectorizedDIoUAligner(
-            max_trans_bound=2.0,
+            max_trans_bound=2.5,
             max_yaw_bound=np.radians(10.0),
-            min_match_score=0.35
+            min_quality_gain=0.03,
+            debug=True
         )
 
     def __getitem__(self, idx):

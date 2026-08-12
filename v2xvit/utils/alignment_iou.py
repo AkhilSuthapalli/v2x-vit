@@ -6,10 +6,11 @@ class RobustVectorizedDIoUAligner:
     Uses relative quality gain (final_quality > init_quality) and expanded search radii
     to prevent over-rejection and ensure high AP recovery.
     """
-    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0), min_quality_gain=0.03, debug=True):
+    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0), min_quality_gain=0.03, min_match_score=0.35, debug=True, **kwargs):
         self.max_trans_bound = max_trans_bound
         self.max_yaw_bound = max_yaw_bound
         self.min_quality_gain = min_quality_gain  # Accepts correction if quality improves by >= 0.03
+        self.min_match_score = min_match_score    # Backward compatibility argument
         self.debug = debug
 
     @staticmethod
@@ -55,7 +56,7 @@ class RobustVectorizedDIoUAligner:
         obb_dists = centroid_dists + 0.5 * corner_dists
         best_matches = np.min(obb_dists, axis=1)
 
-        # Softened distance metric: 1 / (1 + dist/2.0)
+        # Softened distance metric: 1 / (1 + dist / 2.0)
         similarity_score = np.sum(1.0 / (1.0 + best_matches / 2.0))
         quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
 
