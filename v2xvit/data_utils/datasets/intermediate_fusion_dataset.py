@@ -124,8 +124,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     # Apply SVD Correction
                     selected_cav_base['params']['transformation_matrix'] = \
                         T_corr @ selected_cav_base['params']['transformation_matrix']
-                    selected_cav_base['params']['spatial_correction_matrix'] = \
-                        T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
                     new_T = selected_cav_base['params']['transformation_matrix']
                     print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
