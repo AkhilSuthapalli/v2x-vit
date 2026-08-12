@@ -27,8 +27,8 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'], train)
 
-        # 2. Instantiate Debug Aligner
-        self.aligner = BoxCornerSVDAligner(max_match_dist=6.0, min_boxes_required=2, debug=True)
+        # 2. Instantiate True-Geometry Debug Aligner
+        self.aligner = BoxCornerSVDAligner(max_match_dist=3.0, min_boxes_required=2, debug=True)
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(
@@ -98,15 +98,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             # -------------------------------------------------------------
             if cav_id != ego_id and len(ego_boxes_ref) >= 2:
                 
-                # A. Generate the Sender's GT boxes in its OWN local coordinate frame
                 sender_local_boxes, sender_mask, _ = self.post_processor.generate_object_center(
                     [selected_cav_base], selected_cav_base['params']['lidar_pose']
                 )
                 sender_local_boxes = sender_local_boxes[sender_mask == 1]
                 
                 if len(sender_local_boxes) >= 2:
-                    # B. Warp local boxes to Ego Frame using the NOISY matrix.
-                    # This perfectly simulates what a local noisy detection network would output!
                     noisy_matrix = selected_cav_base['params']['transformation_matrix']
                     
                     centers = sender_local_boxes[:, :3]
@@ -116,7 +113,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     sender_boxes_noisy = sender_local_boxes.copy()
                     sender_boxes_noisy[:, :3] = transformed_centers[:, :3]
                     
-                    # Warp yaw
                     yaw_offset = np.arctan2(noisy_matrix[1, 0], noisy_matrix[0, 0])
                     yaw_idx = 6 if sender_boxes_noisy.shape[1] > 6 else 4
                     sender_boxes_noisy[:, yaw_idx] += yaw_offset
@@ -125,7 +121,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     orig_T = noisy_matrix.copy()
                     T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy, cav_id=cav_id)
                     
-                    # D. Apply SVD Correction
+                    # Apply SVD Correction
                     selected_cav_base['params']['transformation_matrix'] = \
                         T_corr @ selected_cav_base['params']['transformation_matrix']
                     selected_cav_base['params']['spatial_correction_matrix'] = \
