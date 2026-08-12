@@ -16,7 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-from v2xvit.utils.alignment_iou import BoundedNelderMeadAligner
+from v2xvit.utils.alignment_iou import AdvancedDIoUAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -28,10 +28,9 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
-        self.aligner = BoundedNelderMeadAligner(
-            max_trans_bound=2.5,            
-            max_yaw_bound=np.radians(10.0), 
-            max_pair_dist=5.0              
+        self.aligner = AdvancedDIoUAligner(
+            max_trans_bound=2.5,
+            max_yaw_bound=np.radians(10.0)             
         )
 
     def __getitem__(self, idx):
