@@ -1,5 +1,5 @@
 """
-Dataset class for intermediate fusion (Approach 3 - Corner SVD Debug)
+Dataset class for intermediate fusion (Approach 3 - Simulated Noisy Proposals)
 """
 import math
 from collections import OrderedDict
@@ -80,7 +80,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         if self.visualize:
             projected_lidar_stack = []
 
-        # Extract Ego Reference Boxes
+        # 1. Extract Ego Reference Boxes (Clean Ground Truth acting as Anchor)
         ego_cav_base = base_data_dict[ego_id]
         ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
         ego_boxes_ref = ego_processed_ref.get('object_bbx_center', np.array([]))
@@ -94,31 +94,46 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 continue
 
             # -------------------------------------------------------------
-            # APPROACH 3 HOOK: Corner SVD Alignment
+            # APPROACH 3 HOOK: Corner SVD Alignment via Simulated Proposals
             # -------------------------------------------------------------
             if cav_id != ego_id and len(ego_boxes_ref) >= 2:
-                sender_processed_noisy, void_check = self.get_item_single_car(
-                    selected_cav_base, ego_lidar_pose)
                 
-                if not void_check:
-                    sender_boxes_noisy = sender_processed_noisy.get('object_bbx_center', np.array([]))
+                # A. Generate the Sender's GT boxes in its OWN local coordinate frame
+                sender_local_boxes, sender_mask, _ = self.post_processor.generate_object_center(
+                    [selected_cav_base], selected_cav_base['params']['lidar_pose']
+                )
+                sender_local_boxes = sender_local_boxes[sender_mask == 1]
+                
+                if len(sender_local_boxes) >= 2:
+                    # B. Warp local boxes to Ego Frame using the NOISY matrix.
+                    # This perfectly simulates what a local noisy detection network would output!
+                    noisy_matrix = selected_cav_base['params']['transformation_matrix']
                     
-                    if len(sender_boxes_noisy) >= 2:
-                        
-                        orig_T = selected_cav_base['params']['transformation_matrix'].copy()
-                        
-                        # Run the SVD aligner
-                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy, cav_id=cav_id)
-                        
-                        # Apply Correction (Order matters! Try swapping this if the offset is wrong)
-                        selected_cav_base['params']['transformation_matrix'] = \
-                            T_corr @ selected_cav_base['params']['transformation_matrix']
-                        selected_cav_base['params']['spatial_correction_matrix'] = \
-                            T_corr @ selected_cav_base['params']['spatial_correction_matrix']
+                    centers = sender_local_boxes[:, :3]
+                    centers_homo = np.hstack([centers, np.ones((centers.shape[0], 1))])
+                    transformed_centers = (noisy_matrix @ centers_homo.T).T
+                    
+                    sender_boxes_noisy = sender_local_boxes.copy()
+                    sender_boxes_noisy[:, :3] = transformed_centers[:, :3]
+                    
+                    # Warp yaw
+                    yaw_offset = np.arctan2(noisy_matrix[1, 0], noisy_matrix[0, 0])
+                    yaw_idx = 6 if sender_boxes_noisy.shape[1] > 6 else 4
+                    sender_boxes_noisy[:, yaw_idx] += yaw_offset
+                    
+                    # C. Run SVD Alignment on the simulated noisy proposals
+                    orig_T = noisy_matrix.copy()
+                    T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy, cav_id=cav_id)
+                    
+                    # D. Apply SVD Correction
+                    selected_cav_base['params']['transformation_matrix'] = \
+                        T_corr @ selected_cav_base['params']['transformation_matrix']
+                    selected_cav_base['params']['spatial_correction_matrix'] = \
+                        T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
-                        new_T = selected_cav_base['params']['transformation_matrix']
-                        print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
-                        print(f"[DEBUG DATASET] T_matrix translation AFTER : x={new_T[0,3]:.3f}, y={new_T[1,3]:.3f}\n")
+                    new_T = selected_cav_base['params']['transformation_matrix']
+                    print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
+                    print(f"[DEBUG DATASET] T_matrix translation AFTER : x={new_T[0,3]:.3f}, y={new_T[1,3]:.3f}\n")
 
             # Standard processing continues
             selected_cav_processed, void_lidar = self.get_item_single_car(
