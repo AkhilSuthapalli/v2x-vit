@@ -40,6 +40,15 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             self.retrieve_base_data(idx,
                                     cur_ego_pose_flag=self.cur_ego_pose_flag)
 
+        ego_key = None
+        for cav_id, cav_content in base_data_dict.items():
+            if cav_content.get('ego', False):
+                ego_key = cav_id
+                break
+
+        if ego_key is not None and list(base_data_dict.keys())[0] != ego_key:
+            base_data_dict.move_to_end(ego_key, last=False)
+
         processed_data_dict = OrderedDict()
         processed_data_dict['ego'] = {}
 
