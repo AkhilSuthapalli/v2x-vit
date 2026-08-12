@@ -16,20 +16,21 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-from v2xvit.utils.alignment_corner_icp import CornerICPAligner
+from v2xvit.utils.alignment_corner_icp import RobustCornerICPAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
-        super(IntermediateFusionDataset, self). \
-            __init__(params, visualize, train)
+        super(IntermediateFusionDataset, self).__init__(params, visualize, train)
         self.cur_ego_pose_flag = params['fusion']['args']['cur_ego_pose_flag']
-        self.pre_processor = build_preprocessor(params['preprocess'],
-                                                train)
+        self.pre_processor = build_preprocessor(params['preprocess'], train)
         self.post_processor = post_processor.build_postprocessor(
-            params['postprocess'],
-            train)
+            params['postprocess'], train)
 
-        self.aligner = CornerICPAligner(max_match_dist=5.0, min_boxes_required=2)
+        self.aligner = RobustCornerICPAligner(
+            max_match_dist=2.5, 
+            min_boxes_required=2, 
+            max_residual_err=1.0
+        )
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(
@@ -63,7 +64,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 ego_lidar_pose = cav_content['params']['lidar_pose']
                 break
 
-        # Check assertion against ego_id (NOT loop-overwritten cav_id)
         assert ego_id == list(base_data_dict.keys())[0], "The first element in the OrderedDict must be ego"
         assert ego_id != -1
         assert len(ego_lidar_pose) > 0
@@ -73,7 +73,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
         ego_boxes_ref = ego_processed_ref.get('object_bbx_center', np.array([]))
 
-        # 4. Approach 3: Apply Corner ICP SVD Alignment before feature extraction
+        # 4. Approach 3 Alignment Hook
         for cav_id, selected_cav_base in base_data_dict.items():
             distance = math.sqrt(
                 (selected_cav_base['params']['lidar_pose'][0] - ego_lidar_pose[0]) ** 2 +
@@ -92,12 +92,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     if len(sender_boxes_noisy) >= 2:
                         T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
                         
+                        # FIX: Apply T_corr ONLY to transformation_matrix for point cloud projection.
+                        # Do NOT pre-multiply spatial_correction_matrix to prevent 2x feature warping on GPU.
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
-                        selected_cav_base['params']['spatial_correction_matrix'] = \
-                            T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
-        # 5. Standard OpenCOOD pairwise matrix and feature assembly
+        # 5. Pairwise transformation matrix and feature collection
         pairwise_t_matrix = self.get_pairwise_transformation(
             base_data_dict, self.params['train_params']['max_cav'])
 
