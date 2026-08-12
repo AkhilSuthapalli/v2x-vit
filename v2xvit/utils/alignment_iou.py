@@ -3,11 +3,12 @@ import numpy as np
 class DiagnosticDIoUAligner:
     """
     Diagnostic Approach 2 Aligner:
-    Logs residual spatial error between estimated correction and actual ground-truth noise.
+    Logs input box counts, quality scores, solved deltas, and GT residual error.
     """
-    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0)):
+    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0), debug=True):
         self.max_trans_bound = max_trans_bound
         self.max_yaw_bound = max_yaw_bound
+        self.debug = debug
 
     @staticmethod
     def _get_2d_corners_batch(boxes):
@@ -37,8 +38,10 @@ class DiagnosticDIoUAligner:
 
         total_dists = centroid_dists + 0.5 * corner_dists
         best_matches = np.min(total_dists, axis=1)
+        
         similarity = np.sum(1.0 / (1.0 + best_matches / 2.0))
-        return -similarity
+        quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
+        return -similarity, quality
 
     def _transform_boxes(self, boxes, dx, dy, dtheta):
         transformed = boxes.copy()
@@ -51,7 +54,12 @@ class DiagnosticDIoUAligner:
         return transformed
 
     def align(self, ego_boxes, sender_boxes_ego_frame, T_gt_noise=None):
+        if self.debug:
+            print(f"\n[DEBUG ALIGNER] Input Box Counts -> Ego: {len(ego_boxes)}, Sender (Ego Frame): {len(sender_boxes_ego_frame)}")
+
         if len(ego_boxes) == 0 or len(sender_boxes_ego_frame) == 0:
+            if self.debug:
+                print("[DEBUG ALIGNER] -> REJECTED: Empty box set. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         # Candidate filtering
@@ -62,9 +70,14 @@ class DiagnosticDIoUAligner:
                 candidate_sender.append(s_box)
 
         if len(candidate_sender) == 0:
+            if self.debug:
+                print("[DEBUG ALIGNER] -> REJECTED: 0 sender boxes within 8.0m radius. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         candidate_sender = np.array(candidate_sender)
+
+        # Compute initial baseline quality
+        _, init_quality = self._compute_diou_cost(ego_boxes, candidate_sender)
 
         # 2-Pass Grid Search
         x_range = np.linspace(-1.5, 1.5, 7)
@@ -73,17 +86,24 @@ class DiagnosticDIoUAligner:
 
         best_cost = float('inf')
         best_delta = (0.0, 0.0, 0.0)
+        best_quality = 0.0
 
         for dx in x_range:
             for dy in y_range:
                 for dtheta in yaw_range:
                     shifted = self._transform_boxes(candidate_sender, dx, dy, dtheta)
-                    cost = self._compute_diou_cost(ego_boxes, shifted)
+                    cost, quality = self._compute_diou_cost(ego_boxes, shifted)
                     if cost < best_cost:
                         best_cost = cost
                         best_delta = (dx, dy, dtheta)
+                        best_quality = quality
 
         opt_dx, opt_dy, opt_dtheta = best_delta
+        quality_gain = best_quality - init_quality
+
+        if self.debug:
+            print(f"[DEBUG ALIGNER] Quality -> Initial: {init_quality:.4f} | Final: {best_quality:.4f} | Gain: +{quality_gain:.4f}")
+            print(f"[DEBUG ALIGNER] Solved Delta -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
 
         # Construct SE(3) matrix
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
@@ -93,17 +113,16 @@ class DiagnosticDIoUAligner:
         T_corr[0, 3] = opt_dx
         T_corr[1, 3] = opt_dy
 
-        # DIAGNOSTIC CHECK: Print estimated vs true error if T_gt_noise is available
-        if T_gt_noise is not None:
+        # Print estimated vs true GT noise offset if available
+        if T_gt_noise is not None and self.debug:
             gt_dx, gt_dy = T_gt_noise[0, 3], T_gt_noise[1, 3]
             gt_yaw = np.arctan2(T_gt_noise[1, 0], T_gt_noise[0, 0])
-            
+
             res_x = abs(gt_dx + opt_dx)
             res_y = abs(gt_dy + opt_dy)
             res_yaw = abs(np.degrees(gt_yaw + opt_dtheta))
 
-            print(f"\n[DIAGNOSTIC] GT Noise Offset  -> dx: {-gt_dx:.2f}m, dy: {-gt_dy:.2f}m, yaw: {-np.degrees(gt_yaw):.2f}°")
-            print(f"[DIAGNOSTIC] Est Correction  -> dx: {opt_dx:.2f}m, dy: {opt_dy:.2f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
-            print(f"[DIAGNOSTIC] Residual Error  -> X: {res_x:.2f}m, Y: {res_y:.2f}m, Yaw: {res_yaw:.2f}°")
+            print(f"[DIAGNOSTIC] GT Noise Offset -> dx: {-gt_dx:.2f}m, dy: {-gt_dy:.2f}m, yaw: {-np.degrees(gt_yaw):.2f}°")
+            print(f"[DIAGNOSTIC] Residual Error -> X: {res_x:.2f}m, Y: {res_y:.2f}m, Yaw: {res_yaw:.2f}°")
 
         return T_corr, (opt_dx, opt_dy, opt_dtheta)

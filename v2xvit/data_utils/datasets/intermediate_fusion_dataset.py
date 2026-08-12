@@ -114,8 +114,13 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                         T_init = selected_cav_base['params']['transformation_matrix']
                         sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Run Instrumented Alignment
-                        T_corr, (dx, dy, dtheta) = self.aligner.align(ego_boxes_ref, sender_boxes_ego_frame)
+                        # Retrieve GT noise matrix if available in base dict
+                        T_gt_noise = selected_cav_base['params'].get('spatial_correction_matrix', None)
+                        
+                        # Run Instrumented Alignment with GT Noise comparison
+                        T_corr, (dx, dy, dtheta) = self.aligner.align(
+                            ego_boxes_ref, sender_boxes_ego_frame, T_gt_noise=T_gt_noise
+                        )
                         
                         # Update transformation matrices
                         selected_cav_base['params']['transformation_matrix'] = \
