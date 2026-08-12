@@ -1,62 +1,54 @@
 import numpy as np
-from scipy.optimize import minimize, linear_sum_assignment
-from shapely.geometry import Polygon
 
-class AdvancedDIoUAligner:
+class FastVectorizedDIoUAligner:
     """
-    Upgraded Approach 2: Coarse-to-Fine Distance-IoU (DIoU) Aligner
-    Combines Hungarian Bipartite Matching, DIoU continuous loss, and 
-    Coarse-to-Fine Grid Seeding to outperform Centroid SVD (Approach 1).
+    Optimized Approach 2: Vectorized Coarse-to-Fine Distance-IoU (DIoU) Aligner
+    Maximizes 2D bounding box overlap in pure NumPy without SciPy or Shapely overhead.
     """
-    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0)):
-        self.max_trans_bound = max_trans_bound  # Covers 1.0m noise + margin
-        self.max_yaw_bound = max_yaw_bound      # Covers 8.0 deg noise + margin
+    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(10.0)):
+        self.max_trans_bound = max_trans_bound  # Strict search bound for 1.0m noise
+        self.max_yaw_bound = max_yaw_bound      # Strict search bound for 8.0 deg noise
 
     @staticmethod
-    def _get_2d_corners(box):
-        """Converts box [x, y, z, dx, dy, dz, yaw] into 2D corner vertices."""
-        x, y = box[0], box[1]
-        length, width = box[3], box[4]
-        yaw = box[6] if len(box) > 6 else box[4]
-
-        l2, w2 = length / 2.0, width / 2.0
-        corners = np.array([
-            [-l2, -w2],
-            [ l2, -w2],
-            [ l2,  w2],
-            [-l2,  w2]
-        ])
-
-        c, s = np.cos(yaw), np.sin(yaw)
-        R = np.array([[c, -s], [s, c]])
-        return corners @ R.T + np.array([x, y])
-
-    def _compute_diou(self, s_box, e_box):
+    def _compute_vectorized_diou(ego_boxes, shifted_sender_boxes):
         """
-        Calculates Distance-IoU (DIoU) between two 2D boxes.
-        DIoU = IoU - (rho^2 / c^2), where rho is centroid distance and c is diagonal of enclosing box.
+        Computes continuous Distance-IoU (DIoU) cost matrix between ego and sender boxes.
+        DIoU = IoU - (rho^2 / c^2)
         """
-        p1 = Polygon(self._get_2d_corners(s_box))
-        p2 = Polygon(self._get_2d_corners(e_box))
+        # Centers
+        e_centers = ego_boxes[:, :2]          # (M, 2)
+        s_centers = shifted_sender_boxes[:, :2] # (N, 2)
 
-        # Centroid distance squared (rho^2)
-        rho_sq = (s_box[0] - e_box[0])**2 + (s_box[1] - e_box[1])**2
+        # Pairwise centroid distance squared (rho^2) -> (N, M)
+        rho_sq = np.sum((s_centers[:, None, :] - e_centers[None, :, :]) ** 2, axis=-1)
 
-        # Diagonal distance squared of enclosing convex hull (c^2)
-        min_x = min(np.min(p1.exterior.coords.xy[0]), np.min(p2.exterior.coords.xy[0]))
-        max_x = max(np.max(p1.exterior.coords.xy[0]), np.max(p2.exterior.coords.xy[0]))
-        min_y = min(np.min(p1.exterior.coords.xy[1]), np.min(p2.exterior.coords.xy[1]))
-        max_y = max(np.max(p1.exterior.coords.xy[1]), np.max(p2.exterior.coords.xy[1]))
-        c_sq = (max_x - min_x)**2 + (max_y - min_y)**2 + 1e-6
+        # Dimensions
+        e_dims = ego_boxes[:, 3:5]            # (M, 2) [length, width]
+        s_dims = shifted_sender_boxes[:, 3:5]   # (N, 2) [length, width]
 
-        if not p1.intersects(p2):
-            return -(rho_sq / c_sq)
+        # Enclosing box diagonal squared (c^2 approximation)
+        dx_max = np.abs(s_centers[:, None, 0] - e_centers[None, :, 0]) + (s_dims[:, None, 0] + e_dims[None, :, 0]) / 2.0
+        dy_max = np.abs(s_centers[:, None, 1] - e_centers[None, :, 1]) + (s_dims[:, None, 1] + e_dims[None, :, 1]) / 2.0
+        c_sq = dx_max**2 + dy_max**2 + 1e-6
 
-        inter = p1.intersection(p2).area
-        union = p1.area + p2.area - inter
-        iou = inter / union if union > 0 else 0.0
+        # Continuous distance penalty (-rho^2 / c^2)
+        dist_penalty = rho_sq / c_sq
 
-        return iou - (rho_sq / c_sq)
+        # Fast BEV Intersection Box Approximation
+        inter_dx = np.maximum(0.0, (s_dims[:, None, 0] + e_dims[None, :, 0]) / 2.0 - np.abs(s_centers[:, None, 0] - e_centers[None, :, 0]))
+        inter_dy = np.maximum(0.0, (s_dims[:, None, 1] + e_dims[None, :, 1]) / 2.0 - np.abs(s_centers[:, None, 1] - e_centers[None, :, 1]))
+        inter_area = inter_dx * inter_dy
+
+        s_area = (s_dims[:, 0] * s_dims[:, 1])[:, None]
+        e_area = (e_dims[:, 0] * e_dims[:, 1])[None, :]
+        union_area = s_area + e_area - inter_area + 1e-6
+
+        iou = inter_area / union_area
+        diou_score = iou - dist_penalty
+
+        # Return negative average DIoU score of best matched box pairs
+        best_matches = np.max(diou_score, axis=1)
+        return -np.sum(best_matches)
 
     def _transform_boxes(self, boxes, dx, dy, dtheta):
         """Applies spatial offset (dx, dy, dtheta) to sender bounding boxes."""
@@ -69,93 +61,65 @@ class AdvancedDIoUAligner:
         transformed[:, yaw_idx] += dtheta
         return transformed
 
-    def _objective_function(self, delta, ego_boxes, sender_boxes):
-        """
-        Objective function using Hungarian Algorithm (Bipartite Matching) on DIoU Cost Matrix.
-        """
-        dx, dy, dtheta = delta
-
-        # Hard Boundary Barrier
-        if abs(dx) > self.max_trans_bound or abs(dy) > self.max_trans_bound or abs(dtheta) > self.max_yaw_bound:
-            return 1000.0
-
-        shifted_sender = self._transform_boxes(sender_boxes, dx, dy, dtheta)
-        num_s, num_e = len(shifted_sender), len(ego_boxes)
-
-        # Build pairwise DIoU cost matrix
-        cost_matrix = np.zeros((num_s, num_e))
-        for i, s_box in enumerate(shifted_sender):
-            for j, e_box in enumerate(ego_boxes):
-                # Negative DIoU for minimization
-                cost_matrix[i, j] = -self._compute_diou(s_box, e_box)
-
-        # Hungarian Bipartite Matching for optimal 1-to-1 box assignment
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        total_cost = cost_matrix[row_ind, col_ind].sum()
-
-        return total_cost
-
-    def _coarse_grid_search(self, ego_boxes, sender_boxes):
-        """
-        Coarse-to-fine 3x3x3 grid warm-start to locate global basin of attraction.
-        """
-        x_grid = np.linspace(-1.5, 1.5, 3)
-        y_grid = np.linspace(-1.5, 1.5, 3)
-        theta_grid = np.linspace(-np.radians(8.0), np.radians(8.0), 3)
-
-        best_seed = (0.0, 0.0, 0.0)
+    def _evaluate_grid(self, ego_boxes, sender_boxes, x_range, y_range, yaw_range):
+        """Evaluates a grid of candidate (dx, dy, dtheta) offsets in vectorized NumPy."""
         best_cost = float('inf')
+        best_delta = (0.0, 0.0, 0.0)
 
-        for dx in x_grid:
-            for dy in y_grid:
-                for dtheta in theta_grid:
-                    cost = self._objective_function((dx, dy, dtheta), ego_boxes, sender_boxes)
+        for dx in x_range:
+            for dy in y_range:
+                for dtheta in yaw_range:
+                    shifted_sender = self._transform_boxes(sender_boxes, dx, dy, dtheta)
+                    cost = self._compute_vectorized_diou(ego_boxes, shifted_sender)
+
                     if cost < best_cost:
                         best_cost = cost
-                        best_seed = (dx, dy, dtheta)
+                        best_delta = (dx, dy, dtheta)
 
-        return best_seed
+        return best_delta, best_cost
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
         """
-        Solves relative pose using Coarse Seeding + Bounded Hungarian DIoU Optimization.
+        Solves relative pose T_corr using 2-Pass Coarse-to-Fine Vectorized DIoU Search.
         """
         if len(ego_boxes) == 0 or len(sender_boxes_ego_frame) == 0:
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # 1. Coarse-to-fine Warm Start (Find global basin)
-        best_seed = self._coarse_grid_search(ego_boxes, sender_boxes_ego_frame)
+        # Filter candidate sender boxes within 5m radius
+        candidate_sender = []
+        for s_box in sender_boxes_ego_frame:
+            dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
+            if np.min(dists) <= 5.0:
+                candidate_sender.append(s_box)
 
-        # 2. Local Fine-Tuning via Bounded Simplex
-        step_x, step_y, step_theta = 0.3, 0.3, np.radians(2.0)
-        x0 = np.array(best_seed, dtype=np.float64)
-        custom_simplex = np.array([
-            x0,
-            x0 + [step_x, 0.0, 0.0],
-            x0 + [0.0, step_y, 0.0],
-            x0 + [0.0, 0.0, step_theta]
-        ])
+        if len(candidate_sender) == 0:
+            return np.eye(4), (0.0, 0.0, 0.0)
 
-        res = minimize(
-            self._objective_function,
-            x0=x0,
-            args=(ego_boxes, sender_boxes_ego_frame),
-            method='Nelder-Mead',
-            options={
-                'initial_simplex': custom_simplex,
-                'maxiter': 40,
-                'xatol': 1e-2,
-                'fatol': 1e-2
-            }
+        candidate_sender = np.array(candidate_sender)
+
+        # Pass 1: Coarse Search Grid (Covers +/- 1.5m and +/- 8 deg)
+        coarse_x = np.linspace(-1.5, 1.5, 5)
+        coarse_y = np.linspace(-1.5, 1.5, 5)
+        coarse_yaw = np.linspace(-np.radians(8.0), np.radians(8.0), 5)
+
+        (c_dx, c_dy, c_yaw), _ = self._evaluate_grid(
+            ego_boxes, candidate_sender, coarse_x, coarse_y, coarse_yaw
         )
 
-        opt_dx, opt_dy, opt_dtheta = res.x
+        # Pass 2: Fine Search Grid around Coarse Seed (Fine resolution: +/- 0.3m, +/- 2 deg)
+        fine_x = np.linspace(c_dx - 0.3, c_dx + 0.3, 5)
+        fine_y = np.linspace(c_dy - 0.3, c_dy + 0.3, 5)
+        fine_yaw = np.linspace(c_yaw - np.radians(2.0), c_yaw + np.radians(2.0), 5)
 
-        # Deadband thresholding for clean baseline stability
+        (opt_dx, opt_dy, opt_dtheta), _ = self._evaluate_grid(
+            ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
+        )
+
+        # Deadband safety filter for clean frames
         if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(opt_dtheta) < np.radians(0.3):
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # Construct SE(3) Homogeneous Transformation Matrix
+        # Construct SE(3) Homogeneous Matrix
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
         T_corr = np.eye(4)
         T_corr[0, 0], T_corr[0, 1] = c, -s
