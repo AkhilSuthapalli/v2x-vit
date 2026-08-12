@@ -114,22 +114,15 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                         T_init = selected_cav_base['params']['transformation_matrix']
                         sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Extract TRUE noise matrix for diagnostic logging
-                        T_gt_noise = None
-                        if 'clean_transformation_matrix' in selected_cav_base['params']:
-                            T_clean = selected_cav_base['params']['clean_transformation_matrix']
-                            T_gt_noise = T_init @ np.linalg.inv(T_clean)
-                        
-                        # Run High-Precision Alignment
+                        # Solve alignment offset
                         T_corr, (dx, dy, dtheta) = self.aligner.align(
-                            ego_boxes_ref, sender_boxes_ego_frame, T_gt_noise=T_gt_noise
+                            ego_boxes_ref, sender_boxes_ego_frame
                         )
                         
-                        # Apply correction
+                        # FIX: Apply T_corr ONLY to transformation_matrix for point projection.
+                        # Do NOT pre-multiply spatial_correction_matrix to prevent double GPU feature warping.
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
-                        selected_cav_base['params']['spatial_correction_matrix'] = \
-                            T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base,
