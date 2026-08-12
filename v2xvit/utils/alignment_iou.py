@@ -1,27 +1,32 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 class RobustVectorizedDIoUAligner:
     """
-    Approach 2: Relative-Gain Gated OBB DIoU Aligner
-    Uses relative quality gain (final_quality > init_quality) and expanded search radii
-    to prevent over-rejection and ensure high AP recovery.
+    Approach 2: Regularized Canonical-Box DIoU Aligner
+    Uses canonical box sizing, Hungarian matching, and L2 shift regularization
+    to eliminate proposal dimension noise and prevent volatile delta jumps.
     """
-    def __init__(self, max_trans_bound=2.5, max_yaw_bound=np.radians(10.0), min_quality_gain=0.03, min_match_score=0.35, debug=True, **kwargs):
+    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(8.0), 
+                 min_quality_gain=0.04, reg_lambda=0.08, debug=False, **kwargs):
         self.max_trans_bound = max_trans_bound
         self.max_yaw_bound = max_yaw_bound
-        self.min_quality_gain = min_quality_gain  # Accepts correction if quality improves by >= 0.03
-        self.min_match_score = min_match_score    # Backward compatibility argument
+        self.min_quality_gain = min_quality_gain
+        self.reg_lambda = reg_lambda  # L2 regularization weight
         self.debug = debug
 
     @staticmethod
-    def _get_2d_corners_batch(boxes):
-        """Vectorized conversion of (N, 7) boxes into 4 oriented 2D corner points (N, 4, 2)."""
+    def _get_canonical_corners_batch(boxes):
+        """
+        Converts (N, 7) boxes into 2D corner vertices using standard CANONICAL 
+        vehicle dimensions (length=4.5m, width=2.0m) to remove local detection noise.
+        """
         N = len(boxes)
         x, y = boxes[:, 0], boxes[:, 1]
-        length, width = boxes[:, 3], boxes[:, 4]
         yaw = boxes[:, 6] if boxes.shape[1] > 6 else boxes[:, 4]
 
-        l2, w2 = length / 2.0, width / 2.0
+        # Standard canonical car footprint
+        l2, w2 = 4.5 / 2.0, 2.0 / 2.0
 
         base_corners = np.array([
             [-1, -1],
@@ -30,7 +35,7 @@ class RobustVectorizedDIoUAligner:
             [-1,  1]
         ], dtype=np.float32)
 
-        scaled_corners = base_corners[None, :, :] * np.stack([l2, w2], axis=-1)[:, None, :]
+        scaled_corners = base_corners[None, :, :] * np.array([l2, w2], dtype=np.float32)[None, None, :]
         c, s = np.cos(yaw), np.sin(yaw)
         R = np.stack([c, -s, s, c], axis=-1).reshape(N, 2, 2)
 
@@ -39,31 +44,40 @@ class RobustVectorizedDIoUAligner:
 
         return rotated + centers
 
-    def _compute_obb_diou_cost(self, ego_boxes, shifted_sender_boxes):
-        """Calculates softened OBB distance score and match quality."""
+    def _compute_hungarian_diou_cost(self, ego_boxes, shifted_sender_boxes, dx, dy, dtheta):
+        """
+        Calculates Hungarian 1-to-1 DIoU assignment score with L2 shift regularization.
+        """
         s_centers = shifted_sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
         centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
 
-        s_corners = self._get_2d_corners_batch(shifted_sender_boxes)
-        e_corners = self._get_2d_corners_batch(ego_boxes)
+        s_corners = self._get_canonical_corners_batch(shifted_sender_boxes)
+        e_corners = self._get_canonical_corners_batch(ego_boxes)
 
         corner_dists = np.mean(
             np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1),
             axis=-1
         )
 
-        obb_dists = centroid_dists + 0.5 * corner_dists
-        best_matches = np.min(obb_dists, axis=1)
+        obb_dists = centroid_dists + 0.5 * corner_dists  # Pairwise distance matrix (N, M)
 
-        # Softened distance metric: 1 / (1 + dist / 2.0)
-        similarity_score = np.sum(1.0 / (1.0 + best_matches / 2.0))
-        quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
+        # Hungarian Bipartite Matching for unique 1-to-1 pairing
+        row_ind, col_ind = linear_sum_assignment(obb_dists)
+        matched_dists = obb_dists[row_ind, col_ind]
 
-        return -similarity_score, quality
+        # Base similarity score
+        similarity = np.sum(1.0 / (1.0 + matched_dists / 2.0))
+        mean_quality = np.mean(1.0 / (1.0 + matched_dists / 2.0))
+
+        # L2 Regularization penalty: penalizes large shift deltas
+        shift_penalty = self.reg_lambda * (dx**2 + dy**2 + (np.degrees(dtheta) / 4.0)**2)
+        
+        total_cost = -similarity + shift_penalty
+        return total_cost, mean_quality
 
     def _transform_boxes(self, boxes, dx, dy, dtheta):
-        """Applies (dx, dy, dtheta) offset to sender bounding boxes."""
+        """Applies spatial delta offset (dx, dy, dtheta) to sender boxes."""
         transformed = boxes.copy()
         c, s = np.cos(dtheta), np.sin(dtheta)
         R = np.array([[c, -s], [s, c]])
@@ -74,7 +88,7 @@ class RobustVectorizedDIoUAligner:
         return transformed
 
     def _evaluate_grid(self, ego_boxes, sender_boxes, x_range, y_range, yaw_range):
-        """Evaluates 2D OBB search grid in parallel NumPy operations."""
+        """Evaluates 2D OBB search grid using Hungarian assignment."""
         best_cost = float('inf')
         best_delta = (0.0, 0.0, 0.0)
         best_quality = 0.0
@@ -83,7 +97,9 @@ class RobustVectorizedDIoUAligner:
             for dy in y_range:
                 for dtheta in yaw_range:
                     shifted_sender = self._transform_boxes(sender_boxes, dx, dy, dtheta)
-                    cost, quality = self._compute_obb_diou_cost(ego_boxes, shifted_sender)
+                    cost, quality = self._compute_hungarian_diou_cost(
+                        ego_boxes, shifted_sender, dx, dy, dtheta
+                    )
 
                     if cost < best_cost:
                         best_cost = cost
@@ -93,46 +109,40 @@ class RobustVectorizedDIoUAligner:
         return best_delta, best_quality
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
-        """Performs 2-Pass OBB DIoU Grid Search with Relative Quality Gain Gating."""
-        if self.debug:
-            print(f"\n[DEBUG ALIGNER] Input Box Counts -> Ego: {len(ego_boxes)}, Sender (Ego Frame): {len(sender_boxes_ego_frame)}")
-
-        # 1. Require at least 1 box in both frames
+        """Performs Regularized Coarse-to-Fine DIoU Grid Search."""
         if len(ego_boxes) < 1 or len(sender_boxes_ego_frame) < 1:
-            if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED: Empty box set. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # 2. Expanded Distance Pre-filtering (8.0m radius to handle 8 deg heading shift at range)
+        # Distance Pre-filtering (6.0m neighborhood radius)
         candidate_sender = []
         for s_box in sender_boxes_ego_frame:
             dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
-            if np.min(dists) <= 8.0:
+            if np.min(dists) <= 6.0:
                 candidate_sender.append(s_box)
 
         if len(candidate_sender) < 1:
-            if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED: 0 sender boxes within 8.0m radius. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
         candidate_sender = np.array(candidate_sender)
 
-        # Baseline quality at current state (0, 0, 0)
-        _, init_quality = self._compute_obb_diou_cost(ego_boxes, candidate_sender)
+        # Initial baseline quality at (0, 0, 0)
+        _, init_quality = self._compute_hungarian_diou_cost(
+            ego_boxes, candidate_sender, 0.0, 0.0, 0.0
+        )
 
-        # 3. Pass 1: Coarse Grid Search
-        coarse_x = np.linspace(-1.5, 1.5, 5)
-        coarse_y = np.linspace(-1.5, 1.5, 5)
-        coarse_yaw = np.linspace(-np.radians(8.0), np.radians(8.0), 5)
+        # Pass 1: Coarse Grid Search
+        coarse_x = np.linspace(-1.2, 1.2, 5)
+        coarse_y = np.linspace(-1.2, 1.2, 5)
+        coarse_yaw = np.linspace(-np.radians(6.0), np.radians(6.0), 5)
 
         (c_dx, c_dy, c_yaw), coarse_quality = self._evaluate_grid(
             ego_boxes, candidate_sender, coarse_x, coarse_y, coarse_yaw
         )
 
-        # 4. Pass 2: Fine Grid Search
-        fine_x = np.linspace(c_dx - 0.3, c_dx + 0.3, 5)
-        fine_y = np.linspace(c_dy - 0.3, c_dy + 0.3, 5)
-        fine_yaw = np.linspace(c_yaw - np.radians(2.0), c_yaw + np.radians(2.0), 5)
+        # Pass 2: Fine Grid Search around Coarse Seed
+        fine_x = np.linspace(c_dx - 0.25, c_dx + 0.25, 5)
+        fine_y = np.linspace(c_dy - 0.25, c_dy + 0.25, 5)
+        fine_yaw = np.linspace(c_yaw - np.radians(1.5), c_yaw + np.radians(1.5), 5)
 
         (opt_dx, opt_dy, opt_dtheta), final_quality = self._evaluate_grid(
             ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
@@ -140,24 +150,13 @@ class RobustVectorizedDIoUAligner:
 
         quality_gain = final_quality - init_quality
 
-        if self.debug:
-            print(f"[DEBUG ALIGNER] Quality -> Initial: {init_quality:.4f} | Final: {final_quality:.4f} | Gain: +{quality_gain:.4f}")
-            print(f"[DEBUG ALIGNER] Delta -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
-
-        # 5. Relative Gain Check (Accept if optimization improved alignment quality)
+        # Quality gain gate check
         if quality_gain < self.min_quality_gain:
-            if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED: Quality gain (+{quality_gain:.4f}) < Threshold (+{self.min_quality_gain:.4f}). Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
-        # 6. Deadband Threshold Check
+        # Deadband threshold
         if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(opt_dtheta) < np.radians(0.3):
-            if self.debug:
-                print(f"[DEBUG ALIGNER] -> REJECTED BY DEADBAND: Sub-5cm / Sub-0.3deg adjustment. Returning Identity.")
             return np.eye(4), (0.0, 0.0, 0.0)
-
-        if self.debug:
-            print(f"[DEBUG ALIGNER] -> ACCEPTED: Applying T_corr [dx={opt_dx:.3f}m, dy={opt_dy:.3f}m, yaw={np.degrees(opt_dtheta):.2f}°]")
 
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
         T_corr = np.eye(4)
