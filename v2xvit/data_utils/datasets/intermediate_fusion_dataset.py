@@ -1,5 +1,5 @@
 """
-Dataset class for intermediate fusion with Approach 3 (Corner SVD)
+Dataset class for intermediate fusion (Approach 3 - Corner SVD Debug)
 """
 import math
 from collections import OrderedDict
@@ -16,7 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-# 1. IMPORT FRESH APPROACH 3 ALIGNER
+# 1. Import Approach 3 Aligner
 from v2xvit.utils.alignment_corner_icp import BoxCornerSVDAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
@@ -27,16 +27,14 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'], train)
 
-        # 2. INSTANTIATE APPROACH 3 ALIGNER
-        self.aligner = BoxCornerSVDAligner(max_match_dist=6.0, min_boxes_required=2)
+        # 2. Instantiate Debug Aligner
+        self.aligner = BoxCornerSVDAligner(max_match_dist=6.0, min_boxes_required=2, debug=True)
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(
             idx, cur_ego_pose_flag=self.cur_ego_pose_flag)
 
-        # -------------------------------------------------------------
-        # DICTIONARY REORDERING FIX (Ensures Ego is strictly index 0)
-        # -------------------------------------------------------------
+        # --- Ensure Ego is always at index 0 ---
         ego_key = None
         for cav_id, cav_content in base_data_dict.items():
             if cav_content.get('ego', False):
@@ -50,7 +48,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 if cav_id != ego_key:
                     reordered_dict[cav_id] = cav_content
             base_data_dict = reordered_dict
-        # -------------------------------------------------------------
 
         processed_data_dict = OrderedDict()
         processed_data_dict['ego'] = {}
@@ -58,14 +55,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         ego_id = -1
         ego_lidar_pose = []
 
-        # Find ego vehicle's lidar pose
         for cav_id, cav_content in base_data_dict.items():
             if cav_content['ego']:
                 ego_id = cav_id
                 ego_lidar_pose = cav_content['params']['lidar_pose']
                 break
 
-        # Check assertion against ego_id
         assert ego_id == list(base_data_dict.keys())[0], "The first element in the OrderedDict must be ego"
         assert ego_id != -1
         assert len(ego_lidar_pose) > 0
@@ -85,16 +80,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         if self.visualize:
             projected_lidar_stack = []
 
-        # -------------------------------------------------------------
-        # APPROACH 3 HOOK: Extract Ego Bounding Boxes as Reference Anchor
-        # -------------------------------------------------------------
+        # Extract Ego Reference Boxes
         ego_cav_base = base_data_dict[ego_id]
         ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
         ego_boxes_ref = ego_processed_ref.get('object_bbx_center', np.array([]))
 
-        # Loop over all CAVs to process information
         for cav_id, selected_cav_base in base_data_dict.items():
-            # Check if cav is within communication range with ego
             distance = math.sqrt(
                 (selected_cav_base['params']['lidar_pose'][0] - ego_lidar_pose[0]) ** 2 +
                 (selected_cav_base['params']['lidar_pose'][1] - ego_lidar_pose[1]) ** 2
@@ -103,10 +94,9 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 continue
 
             # -------------------------------------------------------------
-            # APPROACH 3 HOOK: Perform Corner SVD Alignment
+            # APPROACH 3 HOOK: Corner SVD Alignment
             # -------------------------------------------------------------
             if cav_id != ego_id and len(ego_boxes_ref) >= 2:
-                # Obtain initial noisy proposals for the sender vehicle
                 sender_processed_noisy, void_check = self.get_item_single_car(
                     selected_cav_base, ego_lidar_pose)
                 
@@ -114,16 +104,23 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     sender_boxes_noisy = sender_processed_noisy.get('object_bbx_center', np.array([]))
                     
                     if len(sender_boxes_noisy) >= 2:
-                        # Compute analytical correction matrix
-                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
                         
-                        # Apply T_corr to matrices before feature warping occurs
+                        orig_T = selected_cav_base['params']['transformation_matrix'].copy()
+                        
+                        # Run the SVD aligner
+                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy, cav_id=cav_id)
+                        
+                        # Apply Correction (Order matters! Try swapping this if the offset is wrong)
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
                         selected_cav_base['params']['spatial_correction_matrix'] = \
                             T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
-            # Process single car with the corrected transformation matrices
+                        new_T = selected_cav_base['params']['transformation_matrix']
+                        print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
+                        print(f"[DEBUG DATASET] T_matrix translation AFTER : x={new_T[0,3]:.3f}, y={new_T[1,3]:.3f}\n")
+
+            # Standard processing continues
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base, ego_lidar_pose)
 
@@ -143,7 +140,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             if self.visualize:
                 projected_lidar_stack.append(selected_cav_processed['projected_lidar'])
 
-        # Exclude all repetitive objects
         unique_indices = [object_id_stack.index(x) for x in set(object_id_stack)]
         if len(unique_indices) > 0:
             object_stack = np.vstack(object_stack)
@@ -151,35 +147,24 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         else:
             object_stack = np.empty((0, 7))
 
-        # Make sure bounding boxes across all frames have the same number
         object_bbx_center = np.zeros((self.params['postprocess']['max_num'], 7))
         mask = np.zeros(self.params['postprocess']['max_num'])
         object_bbx_center[:object_stack.shape[0], :] = object_stack
         mask[:object_stack.shape[0]] = 1
 
-        # Merge preprocessed features from different CAVs into same dict
         cav_num = len(processed_features)
         merged_feature_dict = self.merge_features_to_dict(processed_features)
-
-        # Generate anchor boxes
         anchor_box = self.post_processor.generate_anchor_box()
-
-        # Generate targets label
         label_dict = self.post_processor.generate_label(
-            gt_box_center=object_bbx_center,
-            anchors=anchor_box,
-            mask=mask)
+            gt_box_center=object_bbx_center, anchors=anchor_box, mask=mask)
 
-        # Pad velocity, time_delay, infra to max_cav
         velocity = velocity + (self.max_cav - len(velocity)) * [0.]
         time_delay = time_delay + (self.max_cav - len(time_delay)) * [0.]
         infra = infra + (self.max_cav - len(infra)) * [0.]
         
         spatial_correction_matrix = np.stack(spatial_correction_matrix)
         padding_eye = np.tile(
-            np.eye(4)[None], 
-            (self.max_cav - len(spatial_correction_matrix), 1, 1)
-        )
+            np.eye(4)[None], (self.max_cav - len(spatial_correction_matrix), 1, 1))
         spatial_correction_matrix = np.concatenate(
             [spatial_correction_matrix, padding_eye], axis=0)
 
@@ -213,7 +198,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
 
     def get_item_single_car(self, selected_cav_base, ego_pose):
         selected_cav_processed = {}
-
         transformation_matrix = selected_cav_base['params']['transformation_matrix']
 
         object_bbx_center, object_bbx_mask, object_ids = \
@@ -229,7 +213,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         
         void_lidar = True if lidar_np.shape[0] < 1 else False
         processed_lidar = self.pre_processor.preprocess(lidar_np)
-
         velocity = selected_cav_base['params']['ego_speed'] / 30.0
 
         selected_cav_processed.update({
@@ -239,13 +222,11 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             'processed_features': processed_lidar,
             'velocity': velocity
         })
-
         return selected_cav_processed, void_lidar
 
     @staticmethod
     def merge_features_to_dict(processed_feature_list):
         merged_feature_dict = OrderedDict()
-
         for i in range(len(processed_feature_list)):
             for feature_name, feature in processed_feature_list[i].items():
                 if feature_name not in merged_feature_dict:
@@ -254,25 +235,14 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     merged_feature_dict[feature_name] += feature
                 else:
                     merged_feature_dict[feature_name].append(feature)
-
         return merged_feature_dict
 
     def collate_batch_train(self, batch):
         output_dict = {'ego': {}}
-
-        object_bbx_center = []
-        object_bbx_mask = []
-        object_ids = []
-        processed_lidar_list = []
-        record_len = []
-        label_dict_list = []
-
-        velocity = []
-        time_delay = []
-        infra = []
-
-        pairwise_t_matrix_list = []
-        spatial_correction_matrix_list = []
+        object_bbx_center, object_bbx_mask, object_ids = [], [], []
+        processed_lidar_list, record_len, label_dict_list = [], [], []
+        velocity, time_delay, infra = [], [], []
+        pairwise_t_matrix_list, spatial_correction_matrix_list = [], []
 
         if self.visualize:
             origin_lidar = []
@@ -282,16 +252,13 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             object_bbx_center.append(ego_dict['object_bbx_center'])
             object_bbx_mask.append(ego_dict['object_bbx_mask'])
             object_ids.append(ego_dict['object_ids'])
-
             processed_lidar_list.append(ego_dict['processed_lidar'])
             record_len.append(ego_dict['cav_num'])
             label_dict_list.append(ego_dict['label_dict'])
-
             velocity.append(ego_dict['velocity'])
             time_delay.append(ego_dict['time_delay'])
             infra.append(ego_dict['infra'])
-            spatial_correction_matrix_list.append(
-                ego_dict['spatial_correction_matrix'])
+            spatial_correction_matrix_list.append(ego_dict['spatial_correction_matrix'])
             pairwise_t_matrix_list.append(ego_dict['pairwise_t_matrix'])
 
             if self.visualize:
@@ -299,21 +266,16 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
 
         object_bbx_center = torch.from_numpy(np.array(object_bbx_center))
         object_bbx_mask = torch.from_numpy(np.array(object_bbx_mask))
-
         merged_feature_dict = self.merge_features_to_dict(processed_lidar_list)
-        processed_lidar_torch_dict = \
-            self.pre_processor.collate_batch(merged_feature_dict)
+        processed_lidar_torch_dict = self.pre_processor.collate_batch(merged_feature_dict)
         record_len = torch.from_numpy(np.array(record_len, dtype=int))
-        label_torch_dict = \
-            self.post_processor.collate_batch(label_dict_list)
+        label_torch_dict = self.post_processor.collate_batch(label_dict_list)
 
         velocity = torch.from_numpy(np.array(velocity))
         time_delay = torch.from_numpy(np.array(time_delay))
         infra = torch.from_numpy(np.array(infra))
-        spatial_correction_matrix_list = \
-            torch.from_numpy(np.array(spatial_correction_matrix_list))
-        prior_encoding = \
-            torch.stack([velocity, time_delay, infra], dim=-1).float()
+        spatial_correction_matrix_list = torch.from_numpy(np.array(spatial_correction_matrix_list))
+        prior_encoding = torch.stack([velocity, time_delay, infra], dim=-1).float()
         pairwise_t_matrix = torch.from_numpy(np.array(pairwise_t_matrix_list))
 
         output_dict['ego'].update({
@@ -329,10 +291,8 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         })
 
         if self.visualize:
-            origin_lidar = \
-                np.array(downsample_lidar_minimum(pcd_np_list=origin_lidar))
-            origin_lidar = torch.from_numpy(origin_lidar)
-            output_dict['ego'].update({'origin_lidar': origin_lidar})
+            origin_lidar = np.array(downsample_lidar_minimum(pcd_np_list=origin_lidar))
+            output_dict['ego'].update({'origin_lidar': torch.from_numpy(origin_lidar)})
 
         return output_dict
 
@@ -346,15 +306,10 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             })
 
         transformation_matrix_torch = torch.from_numpy(np.identity(4)).float()
-        output_dict['ego'].update({
-            'transformation_matrix': transformation_matrix_torch
-        })
-
+        output_dict['ego'].update({'transformation_matrix': transformation_matrix_torch})
         return output_dict
 
     def post_process(self, data_dict, output_dict):
-        pred_box_tensor, pred_score = \
-            self.post_processor.post_process(data_dict, output_dict)
+        pred_box_tensor, pred_score = self.post_processor.post_process(data_dict, output_dict)
         gt_box_tensor = self.post_processor.generate_gt_bbx(data_dict)
-
         return pred_box_tensor, pred_score, gt_box_tensor
