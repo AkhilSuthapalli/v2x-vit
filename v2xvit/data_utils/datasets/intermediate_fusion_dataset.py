@@ -197,7 +197,8 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 np.vstack(
                     projected_lidar_stack)})
         return processed_data_dict
-
+    
+    @staticmethod
     def transform_boxes_to_ego(boxes, T):
         """Transforms bounding boxes from CAV local frame to Ego frame using T matrix."""
         if len(boxes) == 0:
