@@ -16,6 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
+from v2xvit.utils.alignment_iou import OptimizedNelderMeadAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -27,6 +28,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
+        self.aligner = OptimizedNelderMeadAligner()
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
@@ -73,6 +75,14 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         if self.visualize:
             projected_lidar_stack = []
 
+        # -----------------------------------------------------------------
+        # APPROACH 2 HOOK: Extract Ego Bounding Boxes as Reference Anchor
+        # -----------------------------------------------------------------
+        ego_cav_base = base_data_dict[ego_id]
+        ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
+        ego_boxes_ref = ego_processed_ref['object_bbx_center']
+
+        
         # loop over all CAVs to process information
         for cav_id, selected_cav_base in base_data_dict.items():
             # check if the cav is within the communication range with ego
@@ -84,6 +94,27 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                                       1]) ** 2)
             if distance > v2xvit.data_utils.datasets.COM_RANGE:
                 continue
+
+            # -------------------------------------------------------------
+            # APPROACH 2 HOOK: Perform Nelder-Mead IoU Pose Alignment
+            # -------------------------------------------------------------
+            if cav_id != ego_id and len(ego_boxes_ref) > 0:
+                # 1. Obtain initial noisy proposals for the sender vehicle
+                sender_processed_noisy, void_check = self.get_item_single_car(
+                    selected_cav_base, ego_lidar_pose)
+                
+                if not void_check:
+                    sender_boxes_noisy = sender_processed_noisy['object_bbx_center']
+                    
+                    if len(sender_boxes_noisy) > 0:
+                        # 2. Compute spatial correction matrix T_corr
+                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        
+                        # 3. Apply T_corr to correct coordinate matrices prior to feature processing
+                        selected_cav_base['params']['transformation_matrix'] = \
+                            T_corr @ selected_cav_base['params']['transformation_matrix']
+                        selected_cav_base['params']['spatial_correction_matrix'] = \
+                            T_corr @ selected_cav_base['params']['spatial_correction_matrix']
 
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base,
