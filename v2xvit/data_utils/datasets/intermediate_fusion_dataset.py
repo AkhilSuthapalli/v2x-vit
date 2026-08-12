@@ -99,7 +99,6 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             # APPROACH 2 HOOK: Perform Nelder-Mead IoU Pose Alignment
             # -------------------------------------------------------------
             if cav_id != ego_id and len(ego_boxes_ref) > 0:
-                # 1. Obtain initial noisy proposals for the sender vehicle
                 sender_processed_noisy, void_check = self.get_item_single_car(
                     selected_cav_base, ego_lidar_pose)
                 
@@ -107,14 +106,21 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     sender_boxes_noisy = sender_processed_noisy['object_bbx_center']
                     
                     if len(sender_boxes_noisy) > 0:
-                        # 2. Compute spatial correction matrix T_corr
-                        T_corr, _ = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        T_orig_trans = selected_cav_base['params']['transformation_matrix'].copy()
                         
-                        # 3. Apply T_corr to correct coordinate matrices prior to feature processing
+                        # Execute Alignment
+                        T_corr, (dx, dy, dtheta) = self.aligner.align(ego_boxes_ref, sender_boxes_noisy)
+                        
+                        # Apply correction
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
                         selected_cav_base['params']['spatial_correction_matrix'] = \
                             T_corr @ selected_cav_base['params']['spatial_correction_matrix']
+
+                        # DEBUG CHECKPOINT 4: Matrix modification verification
+                        print(f"\n[DEBUG DATASET] CAV ID: {cav_id}")
+                        print(f"[DEBUG DATASET] Original T_trans translation: {T_orig_trans[:2, 3]}")
+                        print(f"[DEBUG DATASET] Corrected T_trans translation: {selected_cav_base['params']['transformation_matrix'][:2, 3]}")
 
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base,

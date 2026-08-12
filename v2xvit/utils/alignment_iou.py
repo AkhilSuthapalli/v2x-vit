@@ -76,14 +76,19 @@ class OptimizedNelderMeadAligner:
         return total_cost
 
     def align(self, ego_boxes, sender_boxes, initial_guess=(0.0, 0.0, 0.0)):
-        """
-        Solves for spatial delta T = (dx, dy, dtheta) using Nelder-Mead optimization.
-        Returns corrected transformation matrix T_corr and estimated delta.
-        """
+        # DEBUG CHECKPOINT 1: Empty box detection
+        print(f"\n[DEBUG ALIGNER] Input Box Counts -> Ego: {len(ego_boxes)}, Sender: {len(sender_boxes)}")
+        
         if len(ego_boxes) == 0 or len(sender_boxes) == 0:
+            print("[DEBUG ALIGNER] WARNING: One or both box sets are EMPTY! Returning Identity Matrix.")
             return np.eye(4), (0.0, 0.0, 0.0)
 
+        # DEBUG CHECKPOINT 2: Box orientation and coordinate inspection
+        print(f"[DEBUG ALIGNER] Sample Ego Box [x, y, z, dx, dy, dz, yaw]: {np.round(ego_boxes[0], 2)}")
+        print(f"[DEBUG ALIGNER] Sample Sender Box [x, y, z, dx, dy, dz, yaw]: {np.round(sender_boxes[0], 2)}")
+
         x0 = np.array(initial_guess, dtype=np.float64)
+        initial_cost = self._objective_function(x0, ego_boxes, sender_boxes)
 
         step_x, step_y, step_theta = 0.5, 0.5, np.radians(3.0)
         custom_simplex = np.array([
@@ -107,6 +112,12 @@ class OptimizedNelderMeadAligner:
         )
 
         opt_dx, opt_dy, opt_dtheta = res.x
+        final_cost = res.fun
+
+        # DEBUG CHECKPOINT 3: Optimization outcome & cost drop
+        print(f"[DEBUG ALIGNER] Optimization Success: {res.success} | Iterations: {res.nit}")
+        print(f"[DEBUG ALIGNER] Cost Change: Initial={initial_cost:.4f} -> Final={final_cost:.4f}")
+        print(f"[DEBUG ALIGNER] Solved Offset: dx={opt_dx:.3f}m, dy={opt_dy:.3f}m, yaw={np.degrees(opt_dtheta):.2f}°")
 
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
         T_corr = np.eye(4)
