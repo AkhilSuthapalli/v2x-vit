@@ -28,7 +28,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             params['postprocess'], train)
 
         # 2. Instantiate True-Geometry Debug Aligner
-        self.aligner = BoxCornerSVDAligner(max_match_dist=3.0, min_boxes_required=2, debug=True)
+        self.aligner = BoxCornerSVDAligner(max_match_dist=3.0, min_boxes_required=2, debug=False)
 
     def __getitem__(self, idx):
         base_data_dict = self.retrieve_base_data(
