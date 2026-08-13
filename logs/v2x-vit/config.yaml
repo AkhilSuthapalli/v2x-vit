@@ -210,7 +210,7 @@ wild_setting:
   backbone_delay: 10
   data_size: 1.06
   loc_err: true 
-  ryp_std: 0.2
+  ryp_std: 1
   seed: 25
   transmission_speed: 27
   xyz_std: 0
