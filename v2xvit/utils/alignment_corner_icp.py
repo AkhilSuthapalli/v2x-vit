@@ -3,8 +3,9 @@ from scipy.optimize import linear_sum_assignment
 
 class BoxCornerSVDAligner:
     """
-    Approach 4: Ultimate RANSAC SVD with Manifold-Preserving Corner Alignment
-    Fixes the 180-flip anomaly natively without modulo angle discontinuities.
+    Approach 4 (Final): Canonical RANSAC ICP
+    Uses true dimensions for matching, but Canonical Unit Corners for SVD 
+    to completely decouple spatial alignment from PointPillar dimension jitter.
     """
     def __init__(self, max_match_dist=4.0, min_boxes_required=2, ransac_iters=30, debug=True):
         self.max_match_dist = max_match_dist
@@ -13,13 +14,14 @@ class BoxCornerSVDAligner:
         self.debug = debug
 
     @staticmethod
-    def _get_raw_corners(box):
-        """Converts box [x, y, z, dx, dy, dz, yaw] to 4 raw 2D BEV corners."""
+    def _get_canonical_corners(box):
+        """Converts box to 4 corners using a FIXED unit shape to prevent dimension jitter."""
         x, y = box[0], box[1]
-        l2, w2 = box[3] / 2.0, box[4] / 2.0
         yaw = box[6] if len(box) > 6 else box[4]
         
-        # NO YAW NORMALIZATION. We preserve the continuous angle manifold!
+        # FIXED CANONICAL SHAPE: Strips away PointPillar length/width estimation noise
+        l2, w2 = 1.0, 0.5 
+        
         base_corners = np.array([
             [-l2, -w2],
             [ l2, -w2],
@@ -52,7 +54,7 @@ class BoxCornerSVDAligner:
         if len(ego_boxes) < self.min_boxes_required or len(sender_boxes) < self.min_boxes_required:
             return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
-        # 1. Size-Aware Hungarian Matching
+        # 1. Size-Aware Hungarian Matching (Uses TRUE dimensions to prevent bad pairings)
         s_centers = sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
         s_dims = sender_boxes[:, 3:5]
@@ -69,12 +71,11 @@ class BoxCornerSVDAligner:
 
         for s_i, e_i in zip(s_ind, e_ind):
             if dist_matrix[s_i, e_i] <= self.max_match_dist:
-                e_corners = self._get_raw_corners(ego_boxes[e_i])
-                s_corners = self._get_raw_corners(sender_boxes[s_i])
+                # 2. Extract CANONICAL corners for pure geometric SVD math
+                e_corners = self._get_canonical_corners(ego_boxes[e_i])
+                s_corners = self._get_canonical_corners(sender_boxes[s_i])
 
                 # MANIFOLD-PRESERVING 180-DEGREE FLIP FIX
-                # We check if rolling the corner indices by 2 (a physical 180 degree flip) 
-                # produces a closer geometric match, bypassing any need for angle math.
                 dist_normal = np.sum(np.linalg.norm(e_corners - s_corners, axis=-1))
                 s_corners_flipped = np.roll(s_corners, 2, axis=0)
                 dist_flipped = np.sum(np.linalg.norm(e_corners - s_corners_flipped, axis=-1))
@@ -92,7 +93,7 @@ class BoxCornerSVDAligner:
         matched_e_corners = np.array(matched_e_corners) # Shape: (N, 4, 2)
         N = len(matched_s_corners)
 
-        # 2. RANSAC SVD Loop
+        # 3. RANSAC SVD Loop
         best_inliers = []
         best_offsets = (0.0, 0.0, 0.0)
         best_R = np.eye(2)
@@ -110,7 +111,7 @@ class BoxCornerSVDAligner:
             s_transformed = s_centroids @ R_2d.T + np.array([dx, dy])
             errors = np.linalg.norm(s_transformed - e_centroids, axis=-1)
             
-            inliers = np.where(errors < 0.5)[0]
+            inliers = np.where(errors < 0.4)[0] # Tightened inlier threshold to 0.4m
             
             if len(inliers) > len(best_inliers):
                 best_inliers = inliers
@@ -119,7 +120,7 @@ class BoxCornerSVDAligner:
                 if len(inliers) == N:
                     break
 
-        # 3. Final Polish using ALL verified inliers
+        # 4. Final Polish using ALL verified inliers
         if len(best_inliers) >= self.min_boxes_required:
             P_s_inliers = matched_s_corners[best_inliers].reshape(-1, 2)
             P_e_inliers = matched_e_corners[best_inliers].reshape(-1, 2)
@@ -128,6 +129,7 @@ class BoxCornerSVDAligner:
             opt_dx, opt_dy, opt_dtheta = best_offsets
             final_R = best_R
 
+        # Deadband Filter
         if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(np.degrees(opt_dtheta)) < 0.5:
             return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
