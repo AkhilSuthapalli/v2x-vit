@@ -3,24 +3,22 @@ from scipy.optimize import linear_sum_assignment
 
 class BoxCornerSVDAligner:
     """
-    Approach 4 (Final): Canonical RANSAC ICP
-    Uses true dimensions for matching, but Canonical Unit Corners for SVD 
-    to completely decouple spatial alignment from PointPillar dimension jitter.
+    Approach 3: Optimized RANSAC Corner SVD Aligner
+    Strictly uses 4 bounding box corners per vehicle. Optimized for peak 
+    rotational accuracy by tightening inlier thresholds and evaluating all corners.
     """
-    def __init__(self, max_match_dist=4.0, min_boxes_required=2, ransac_iters=30, debug=True):
+    def __init__(self, max_match_dist=4.0, min_boxes_required=2, ransac_iters=50, debug=True):
         self.max_match_dist = max_match_dist
         self.min_boxes_required = min_boxes_required
         self.ransac_iters = ransac_iters
         self.debug = debug
 
     @staticmethod
-    def _get_canonical_corners(box):
-        """Converts box to 4 corners using a FIXED unit shape to prevent dimension jitter."""
+    def _get_raw_corners(box):
+        """Converts box [x, y, z, dx, dy, dz, yaw] to 4 TRUE 2D BEV corners."""
         x, y = box[0], box[1]
+        l2, w2 = box[3] / 2.0, box[4] / 2.0
         yaw = box[6] if len(box) > 6 else box[4]
-        
-        # FIXED CANONICAL SHAPE: Strips away PointPillar length/width estimation noise
-        l2, w2 = 1.0, 0.5 
         
         base_corners = np.array([
             [-l2, -w2],
@@ -34,7 +32,7 @@ class BoxCornerSVDAligner:
         return (base_corners @ R.T) + np.array([x, y], dtype=np.float64)
 
     def _solve_kabsch(self, P_s, P_e):
-        """Standard Kabsch SVD Algorithm."""
+        """Standard Kabsch SVD Algorithm on Corner Point Clouds."""
         centroid_s = np.mean(P_s, axis=0)
         centroid_e = np.mean(P_e, axis=0)
         H = (P_s - centroid_s).T @ (P_e - centroid_e)
@@ -54,7 +52,7 @@ class BoxCornerSVDAligner:
         if len(ego_boxes) < self.min_boxes_required or len(sender_boxes) < self.min_boxes_required:
             return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
-        # 1. Size-Aware Hungarian Matching (Uses TRUE dimensions to prevent bad pairings)
+        # 1. Hyper-Strict Size-Aware Hungarian Matching
         s_centers = sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
         s_dims = sender_boxes[:, 3:5]
@@ -63,7 +61,8 @@ class BoxCornerSVDAligner:
         dist_matrix = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
         size_penalty = np.sum(np.abs(s_dims[:, None, :] - e_dims[None, :, :]), axis=-1)
         
-        cost_matrix = dist_matrix + (size_penalty * 2.0)
+        # Multiply size penalty by 10 to guarantee we never match vehicles of different sizes
+        cost_matrix = dist_matrix + (size_penalty * 10.0)
         s_ind, e_ind = linear_sum_assignment(cost_matrix)
 
         matched_s_corners = []
@@ -71,9 +70,8 @@ class BoxCornerSVDAligner:
 
         for s_i, e_i in zip(s_ind, e_ind):
             if dist_matrix[s_i, e_i] <= self.max_match_dist:
-                # 2. Extract CANONICAL corners for pure geometric SVD math
-                e_corners = self._get_canonical_corners(ego_boxes[e_i])
-                s_corners = self._get_canonical_corners(sender_boxes[s_i])
+                e_corners = self._get_raw_corners(ego_boxes[e_i])
+                s_corners = self._get_raw_corners(sender_boxes[s_i])
 
                 # MANIFOLD-PRESERVING 180-DEGREE FLIP FIX
                 dist_normal = np.sum(np.linalg.norm(e_corners - s_corners, axis=-1))
@@ -93,13 +91,10 @@ class BoxCornerSVDAligner:
         matched_e_corners = np.array(matched_e_corners) # Shape: (N, 4, 2)
         N = len(matched_s_corners)
 
-        # 3. RANSAC SVD Loop
+        # 2. Precision RANSAC SVD Loop evaluating ALL corners
         best_inliers = []
         best_offsets = (0.0, 0.0, 0.0)
         best_R = np.eye(2)
-
-        s_centroids = np.mean(matched_s_corners, axis=1)
-        e_centroids = np.mean(matched_e_corners, axis=1)
 
         for _ in range(self.ransac_iters):
             idx = np.random.choice(N, min(2, N), replace=False)
@@ -108,10 +103,18 @@ class BoxCornerSVDAligner:
             
             dx, dy, dtheta, R_2d = self._solve_kabsch(P_s_sample, P_e_sample)
             
-            s_transformed = s_centroids @ R_2d.T + np.array([dx, dy])
-            errors = np.linalg.norm(s_transformed - e_centroids, axis=-1)
+            # Evaluate against ALL corners
+            P_s_all = matched_s_corners.reshape(-1, 2)
+            P_e_all = matched_e_corners.reshape(-1, 2)
             
-            inliers = np.where(errors < 0.4)[0] # Tightened inlier threshold to 0.4m
+            s_transformed = P_s_all @ R_2d.T + np.array([dx, dy])
+            errors = np.linalg.norm(s_transformed - P_e_all, axis=-1)
+            
+            # Reshape errors back to per-box (N, 4) and get max error per box
+            box_errors = errors.reshape(N, 4).max(axis=1)
+            
+            # TIGHT INLIER THRESHOLD: 0.2m max corner deviation
+            inliers = np.where(box_errors < 0.2)[0]
             
             if len(inliers) > len(best_inliers):
                 best_inliers = inliers
@@ -120,7 +123,7 @@ class BoxCornerSVDAligner:
                 if len(inliers) == N:
                     break
 
-        # 4. Final Polish using ALL verified inliers
+        # 3. Final Polish using ALL verified inlier corners
         if len(best_inliers) >= self.min_boxes_required:
             P_s_inliers = matched_s_corners[best_inliers].reshape(-1, 2)
             P_e_inliers = matched_e_corners[best_inliers].reshape(-1, 2)
@@ -129,13 +132,9 @@ class BoxCornerSVDAligner:
             opt_dx, opt_dy, opt_dtheta = best_offsets
             final_R = best_R
 
-        # Deadband Filter
-        if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(np.degrees(opt_dtheta)) < 0.5:
-            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
-
         if self.debug:
-            print(f"\n[DEBUG RANSAC SVD] CAV: {cav_id} | Inliers: {len(best_inliers)}/{N}")
-            print(f"[DEBUG RANSAC SVD] Solved Offsets -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
+            print(f"\n[DEBUG APPROACH 3 SVD] CAV: {cav_id} | Inliers: {len(best_inliers)}/{N}")
+            print(f"[DEBUG APPROACH 3 SVD] Offsets -> dx: {opt_dx:.3f}m, dy: {opt_dy:.3f}m, yaw: {np.degrees(opt_dtheta):.2f}°")
 
         T_corr = np.eye(4, dtype=np.float64)
         T_corr[:2, :2] = final_R
