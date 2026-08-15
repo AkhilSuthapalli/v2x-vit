@@ -31,8 +31,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.aligner = DiagnosticDIoUAligner(
             max_trans_bound=2.0,
             max_yaw_bound=np.radians(8.0),
-            # consensus_radius=1.5,
-            # min_consensus_pairs=2
+            reg_lambda=0.01
             )   
 
     def __getitem__(self, idx):
@@ -106,21 +105,20 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
             if cav_id != ego_id and len(ego_boxes_ref) > 0:
                 sender_processed_noisy, void_check = self.get_item_single_car(
                     selected_cav_base, ego_lidar_pose)
-                
+    
                 if not void_check:
                     sender_boxes_local = sender_processed_noisy['object_bbx_center']
-                    
+        
                     if len(sender_boxes_local) > 0:
                         T_init = selected_cav_base['params']['transformation_matrix']
                         sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
                         
-                        # Solve alignment offset
+                        # Solve continuous alignment offset
                         T_corr, (dx, dy, dtheta) = self.aligner.align(
                             ego_boxes_ref, sender_boxes_ego_frame
                         )
                         
-                        # FIX: Apply T_corr ONLY to transformation_matrix for point projection.
-                        # Do NOT pre-multiply spatial_correction_matrix to prevent double GPU feature warping.
+                        # Apply correction to point cloud transformation matrix
                         selected_cav_base['params']['transformation_matrix'] = \
                             T_corr @ selected_cav_base['params']['transformation_matrix']
 

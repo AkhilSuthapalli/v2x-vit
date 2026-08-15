@@ -1,12 +1,13 @@
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import minimize, linear_sum_assignment
 
 class DiagnosticDIoUAligner:
     """
-    Upgraded Approach 2: Hungarian Bipartite DIoU Aligner
-    Prevents many-to-one box collapse and optimizes grid speed.
+    Approach 2: High-Precision Hybrid Hungarian DIoU + Nelder-Mead Aligner
+    Combines global Hungarian bipartite assignment, continuous Distance-IoU,
+    and continuous Nelder-Mead simplex polishing to eliminate grid quantization.
     """
-    def __init__(self, max_trans_bound=1.8, max_yaw_bound=np.radians(4.0), reg_lambda=0.05, debug=True):
+    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(6.0), reg_lambda=0.01, debug=False):
         self.max_trans_bound = max_trans_bound
         self.max_yaw_bound = max_yaw_bound
         self.reg_lambda = reg_lambda
@@ -14,15 +15,16 @@ class DiagnosticDIoUAligner:
 
     @staticmethod
     def _get_canonical_corners_batch(boxes):
+        """Vectorized conversion of (N, 7) boxes to 4 2D BEV canonical corner coordinates."""
         N = len(boxes)
         x, y = boxes[:, 0], boxes[:, 1]
         yaw = boxes[:, 6] if boxes.shape[1] > 6 else boxes[:, 4]
 
         # Standard canonical vehicle footprint (4.5m x 2.0m)
         l2, w2 = 4.5 / 2.0, 2.0 / 2.0
-        base_corners = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=np.float32)
+        base_corners = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=np.float64)
 
-        scaled = base_corners[None, :, :] * np.array([l2, w2], dtype=np.float32)[None, None, :]
+        scaled = base_corners[None, :, :] * np.array([l2, w2], dtype=np.float64)[None, None, :]
         c, s = np.cos(yaw), np.sin(yaw)
         R = np.stack([c, -s, s, c], axis=-1).reshape(N, 2, 2)
 
@@ -30,101 +32,133 @@ class DiagnosticDIoUAligner:
         centers = np.stack([x, y], axis=-1)[:, None, :]
         return rotated + centers
 
-    def _compute_diou_cost(self, ego_boxes, shifted_sender_boxes, dx, dy, dtheta):
-        s_centers = shifted_sender_boxes[:, :2]
-        e_centers = ego_boxes[:, :2]
-        
-        # Build full NxM distance matrices
-        centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
-
-        s_corners = self._get_canonical_corners_batch(shifted_sender_boxes)
-        e_corners = self._get_canonical_corners_batch(ego_boxes)
-        corner_dists = np.mean(np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1), axis=-1)
-
-        cost_matrix = centroid_dists + 0.5 * corner_dists
-
-        # FIX 1: HUNGARIAN MATCHING
-        # Guarantees 1-to-1 vehicle matching, preventing "greedy collapse"
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        best_matches = cost_matrix[row_ind, col_ind]
-
-        similarity = np.sum(1.0 / (1.0 + best_matches / 2.0))
-        quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
-
-        # L2 penalty to penalize erratic large shifts
-        reg_penalty = self.reg_lambda * (dx**2 + dy**2 + (np.degrees(dtheta))**2)
-        total_cost = -similarity + reg_penalty
-
-        return total_cost, quality
-
     def _transform_boxes(self, boxes, dx, dy, dtheta):
+        """Applies continuous (dx, dy, dtheta) offset to sender bounding boxes."""
         transformed = boxes.copy()
         c, s = np.cos(dtheta), np.sin(dtheta)
-        R = np.array([[c, -s], [s, c]])
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
 
-        transformed[:, :2] = transformed[:, :2] @ R.T + np.array([dx, dy])
+        transformed[:, :2] = transformed[:, :2] @ R.T + np.array([dx, dy], dtype=np.float64)
         yaw_idx = 6 if transformed.shape[1] > 6 else 4
         transformed[:, yaw_idx] += dtheta
         return transformed
 
-    def _evaluate_grid(self, ego_boxes, sender_boxes, x_range, y_range, yaw_range):
-        best_cost = float('inf')
-        best_delta = (0.0, 0.0, 0.0)
-        best_quality = 0.0
+    def _compute_cost(self, delta, ego_boxes, sender_boxes):
+        """
+        Continuous Hungarian Distance-IoU Objective Function.
+        Evaluates 1-to-1 optimal assignment between ego and shifted sender boxes.
+        """
+        dx, dy, dtheta = delta
 
-        for dx in x_range:
-            for dy in y_range:
-                for dtheta in yaw_range:
-                    shifted = self._transform_boxes(sender_boxes, dx, dy, dtheta)
-                    cost, quality = self._compute_diou_cost(ego_boxes, shifted, dx, dy, dtheta)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_delta = (dx, dy, dtheta)
-                        best_quality = quality
+        # Hard boundary barrier
+        if abs(dx) > self.max_trans_bound or abs(dy) > self.max_trans_bound or abs(dtheta) > self.max_yaw_bound:
+            return 1e5
 
-        return best_delta, best_quality
+        shifted_sender = self._transform_boxes(sender_boxes, dx, dy, dtheta)
+
+        s_centers = shifted_sender[:, :2]
+        e_centers = ego_boxes[:, :2]
+
+        # Centroid distance matrix (N, M)
+        centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
+
+        # Corner geometry distance matrix (N, M)
+        s_corners = self._get_canonical_corners_batch(shifted_sender)
+        e_corners = self._get_canonical_corners_batch(ego_boxes)
+        corner_dists = np.mean(
+            np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1),
+            axis=-1
+        )
+
+        # Combined Chamfer-DIoU Cost Matrix
+        cost_matrix = centroid_dists + 0.6 * corner_dists
+
+        # Optimal 1-to-1 Bipartite Matching (Prevents Greedy Collapse)
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        matched_costs = cost_matrix[row_ind, col_ind]
+
+        # Robust Inlier Gating: downweight outliers > 4.0m
+        robust_weights = 1.0 / (1.0 + (matched_costs / 2.0)**2)
+        total_loss = np.sum(matched_costs * robust_weights)
+
+        # L2 Regularizer to prevent extreme drifts
+        reg_penalty = self.reg_lambda * (dx**2 + dy**2 + (np.degrees(dtheta))**2)
+        return total_loss + reg_penalty
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
+        """
+        Executes Two-Stage Approach 2 Alignment:
+        1. Coarse Global Grid Search (finds global basin).
+        2. Continuous Bounded Nelder-Mead Simplex (eliminates quantization errors).
+        """
         if len(ego_boxes) == 0 or len(sender_boxes_ego_frame) == 0:
-            return np.eye(4), (0.0, 0.0, 0.0)
+            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
-        # Distance Pre-filtering (5.0m search radius)
+        # Neighborhood pre-filter (6.0m search window)
         candidate_sender = []
         for s_box in sender_boxes_ego_frame:
             dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
-            if np.min(dists) <= 5.0:
+            if np.min(dists) <= 6.0:
                 candidate_sender.append(s_box)
 
         if len(candidate_sender) == 0:
-            return np.eye(4), (0.0, 0.0, 0.0)
+            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
         candidate_sender = np.array(candidate_sender)
-        _, init_quality = self._compute_diou_cost(ego_boxes, candidate_sender, 0.0, 0.0, 0.0)
 
-        # FIX 2: CONDENSED GRID SEARCH
-        # Drops iterations from 1,296 down to 250, massively speeding up the data loader
+        # -------------------------------------------------------------
+        # STAGE 1: Coarse Grid Warm-Start (Locate Global Basin)
+        # -------------------------------------------------------------
         coarse_x = np.linspace(-1.2, 1.2, 5)
         coarse_y = np.linspace(-1.2, 1.2, 5)
         coarse_yaw = np.linspace(-np.radians(3.0), np.radians(3.0), 5)
 
-        (c_dx, c_dy, c_yaw), coarse_quality = self._evaluate_grid(
-            ego_boxes, candidate_sender, coarse_x, coarse_y, coarse_yaw
+        best_cost = float('inf')
+        best_seed = (0.0, 0.0, 0.0)
+
+        for dx in coarse_x:
+            for dy in coarse_y:
+                for dtheta in coarse_yaw:
+                    cost = self._compute_cost((dx, dy, dtheta), ego_boxes, candidate_sender)
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_seed = (dx, dy, dtheta)
+
+        # -------------------------------------------------------------
+        # STAGE 2: Continuous Nelder-Mead Simplex Polish
+        # -------------------------------------------------------------
+        x0 = np.array(best_seed, dtype=np.float64)
+        step_x, step_y, step_theta = 0.15, 0.15, np.radians(0.75)
+        
+        custom_simplex = np.array([
+            x0,
+            x0 + [step_x, 0.0, 0.0],
+            x0 + [0.0, step_y, 0.0],
+            x0 + [0.0, 0.0, step_theta]
+        ])
+
+        res = minimize(
+            self._compute_cost,
+            x0=x0,
+            args=(ego_boxes, candidate_sender),
+            method='Nelder-Mead',
+            options={
+                'initial_simplex': custom_simplex,
+                'maxiter': 40,
+                'xatol': 1e-3,  # 1mm spatial resolution
+                'fatol': 1e-3
+            }
         )
 
-        fine_x = np.linspace(c_dx - 0.30, c_dx + 0.30, 5)
-        fine_y = np.linspace(c_dy - 0.30, c_dy + 0.30, 5)
-        fine_yaw = np.linspace(c_yaw - np.radians(1.5), c_yaw + np.radians(1.5), 5)
+        opt_dx, opt_dy, opt_dtheta = res.x
 
-        (opt_dx, opt_dy, opt_dtheta), final_quality = self._evaluate_grid(
-            ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
-        )
+        # Deadband filter to protect clean baseline frames
+        if abs(opt_dx) < 0.03 and abs(opt_dy) < 0.03 and abs(opt_dtheta) < np.radians(0.15):
+            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
 
-        # Deadband Safety Filter for small corrections
-        if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(opt_dtheta) < np.radians(0.25):
-            return np.eye(4), (0.0, 0.0, 0.0)
-
+        # Construct 4x4 Homogeneous SE(3) Transformation Matrix
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
-        T_corr = np.eye(4)
+        T_corr = np.eye(4, dtype=np.float64)
         T_corr[0, 0], T_corr[0, 1] = c, -s
         T_corr[1, 0], T_corr[1, 1] = s, c
         T_corr[0, 3] = opt_dx
