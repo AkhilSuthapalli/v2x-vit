@@ -1,9 +1,10 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 class DiagnosticDIoUAligner:
     """
-    Approach 2: Regularized Sub-Voxel DIoU Aligner
-    Prevents double-correction feature degradation and stabilizes delta jumps.
+    Upgraded Approach 2: Hungarian Bipartite DIoU Aligner
+    Prevents many-to-one box collapse and optimizes grid speed.
     """
     def __init__(self, max_trans_bound=1.8, max_yaw_bound=np.radians(4.0), reg_lambda=0.05, debug=True):
         self.max_trans_bound = max_trans_bound
@@ -32,14 +33,20 @@ class DiagnosticDIoUAligner:
     def _compute_diou_cost(self, ego_boxes, shifted_sender_boxes, dx, dy, dtheta):
         s_centers = shifted_sender_boxes[:, :2]
         e_centers = ego_boxes[:, :2]
+        
+        # Build full NxM distance matrices
         centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
 
         s_corners = self._get_canonical_corners_batch(shifted_sender_boxes)
         e_corners = self._get_canonical_corners_batch(ego_boxes)
         corner_dists = np.mean(np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1), axis=-1)
 
-        total_dists = centroid_dists + 0.5 * corner_dists
-        best_matches = np.min(total_dists, axis=1)
+        cost_matrix = centroid_dists + 0.5 * corner_dists
+
+        # FIX 1: HUNGARIAN MATCHING
+        # Guarantees 1-to-1 vehicle matching, preventing "greedy collapse"
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        best_matches = cost_matrix[row_ind, col_ind]
 
         similarity = np.sum(1.0 / (1.0 + best_matches / 2.0))
         quality = np.mean(1.0 / (1.0 + best_matches / 2.0))
@@ -94,25 +101,23 @@ class DiagnosticDIoUAligner:
         candidate_sender = np.array(candidate_sender)
         _, init_quality = self._compute_diou_cost(ego_boxes, candidate_sender, 0.0, 0.0, 0.0)
 
-        # PASS 1: Coarse Grid Search
-        coarse_x = np.linspace(-1.2, 1.2, 9)
-        coarse_y = np.linspace(-1.2, 1.2, 9)
-        coarse_yaw = np.linspace(-np.radians(3.0), np.radians(3.0), 7)
+        # FIX 2: CONDENSED GRID SEARCH
+        # Drops iterations from 1,296 down to 250, massively speeding up the data loader
+        coarse_x = np.linspace(-1.2, 1.2, 5)
+        coarse_y = np.linspace(-1.2, 1.2, 5)
+        coarse_yaw = np.linspace(-np.radians(3.0), np.radians(3.0), 5)
 
         (c_dx, c_dy, c_yaw), coarse_quality = self._evaluate_grid(
             ego_boxes, candidate_sender, coarse_x, coarse_y, coarse_yaw
         )
 
-        # PASS 2: Fine Grid Search (0.05m / 5cm resolution)
-        fine_x = np.linspace(c_dx - 0.20, c_dx + 0.20, 9)
-        fine_y = np.linspace(c_dy - 0.20, c_dy + 0.20, 9)
-        fine_yaw = np.linspace(c_yaw - np.radians(1.0), c_yaw + np.radians(1.0), 9)
+        fine_x = np.linspace(c_dx - 0.30, c_dx + 0.30, 5)
+        fine_y = np.linspace(c_dy - 0.30, c_dy + 0.30, 5)
+        fine_yaw = np.linspace(c_yaw - np.radians(1.5), c_yaw + np.radians(1.5), 5)
 
         (opt_dx, opt_dy, opt_dtheta), final_quality = self._evaluate_grid(
             ego_boxes, candidate_sender, fine_x, fine_y, fine_yaw
         )
-
-        quality_gain = final_quality - init_quality
 
         # Deadband Safety Filter for small corrections
         if abs(opt_dx) < 0.05 and abs(opt_dy) < 0.05 and abs(opt_dtheta) < np.radians(0.25):
