@@ -16,7 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
-from v2xvit.utils.alignment_iou import PureGridIoUAligner
+from v2xvit.utils.alignment_iou import FastVectorizedIoUAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -28,7 +28,7 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
-        self.aligner = PureGridIoUAligner()
+        self.aligner = FastVectorizedIoUAligner()
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
