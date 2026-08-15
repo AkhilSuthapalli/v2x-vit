@@ -1,164 +1,101 @@
 import numpy as np
-from scipy.optimize import minimize, linear_sum_assignment
+from shapely.geometry import Polygon
+from scipy.optimize import linear_sum_assignment
 
-class DiagnosticDIoUAligner:
+class PureGridIoUAligner:
     """
-    Approach 2: High-Precision Hybrid Hungarian DIoU + Nelder-Mead Aligner
-    Combines global Hungarian bipartite assignment, continuous Distance-IoU,
-    and continuous Nelder-Mead simplex polishing to eliminate grid quantization.
+    Complete rewrite of Approach 2: Pure Global Polygon IoU Grid Search.
+    Abandons continuous optimizers to prevent volatile spatial jumps.
+    Directly maximizes exact geometric Intersection-over-Union (IoU) using Shapely.
     """
-    def __init__(self, max_trans_bound=2.0, max_yaw_bound=np.radians(6.0), reg_lambda=0.01, debug=False):
-        self.max_trans_bound = max_trans_bound
-        self.max_yaw_bound = max_yaw_bound
-        self.reg_lambda = reg_lambda
-        self.debug = debug
+    def __init__(self, max_trans=1.2, max_yaw=np.radians(5.0), min_iou_gate=0.10):
+        self.max_trans = max_trans
+        self.max_yaw = max_yaw
+        self.min_iou_gate = min_iou_gate # Strict gate to prevent false alignments
 
     @staticmethod
-    def _get_canonical_corners_batch(boxes):
-        """Vectorized conversion of (N, 7) boxes to 4 2D BEV canonical corner coordinates."""
-        N = len(boxes)
-        x, y = boxes[:, 0], boxes[:, 1]
-        yaw = boxes[:, 6] if boxes.shape[1] > 6 else boxes[:, 4]
-
-        # Standard canonical vehicle footprint (4.5m x 2.0m)
-        l2, w2 = 4.5 / 2.0, 2.0 / 2.0
-        base_corners = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=np.float64)
-
-        scaled = base_corners[None, :, :] * np.array([l2, w2], dtype=np.float64)[None, None, :]
+    def get_polygon(box):
+        """Converts a bounding box array into an exact Shapely 2D Polygon."""
+        x, y = box[0], box[1]
+        l, w = 4.5, 2.0 # Force standard canonical vehicle dimensions
+        yaw = box[6] if len(box) > 6 else box[4]
+        
         c, s = np.cos(yaw), np.sin(yaw)
-        R = np.stack([c, -s, s, c], axis=-1).reshape(N, 2, 2)
+        corners = np.array([[-l/2, -w/2], [l/2, -w/2], [l/2, w/2], [-l/2, w/2]])
+        R = np.array([[c, -s], [s, c]])
+        
+        # Rotate and translate
+        transformed_corners = (corners @ R.T) + np.array([x, y])
+        return Polygon(transformed_corners)
 
-        rotated = np.matmul(scaled, R.transpose(0, 2, 1))
-        centers = np.stack([x, y], axis=-1)[:, None, :]
-        return rotated + centers
-
-    def _transform_boxes(self, boxes, dx, dy, dtheta):
-        """Applies continuous (dx, dy, dtheta) offset to sender bounding boxes."""
-        transformed = boxes.copy()
+    def compute_total_iou(self, ego_polys, sender_boxes, dx, dy, dtheta):
+        """Calculates exact Shapely IoU across transformed sender boxes."""
+        shifted_sender = sender_boxes.copy()
         c, s = np.cos(dtheta), np.sin(dtheta)
-        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        R = np.array([[c, -s], [s, c]])
+        
+        # Apply trial shift
+        shifted_sender[:, :2] = shifted_sender[:, :2] @ R.T + np.array([dx, dy])
+        yaw_idx = 6 if shifted_sender.shape[1] > 6 else 4
+        shifted_sender[:, yaw_idx] += dtheta
 
-        transformed[:, :2] = transformed[:, :2] @ R.T + np.array([dx, dy], dtype=np.float64)
-        yaw_idx = 6 if transformed.shape[1] > 6 else 4
-        transformed[:, yaw_idx] += dtheta
-        return transformed
+        sender_polys = [self.get_polygon(b) for b in shifted_sender]
 
-    def _compute_cost(self, delta, ego_boxes, sender_boxes):
-        """
-        Continuous Hungarian Distance-IoU Objective Function.
-        Evaluates 1-to-1 optimal assignment between ego and shifted sender boxes.
-        """
-        dx, dy, dtheta = delta
+        # Build Exact IoU Matrix
+        iou_matrix = np.zeros((len(sender_polys), len(ego_polys)))
+        for i, s_poly in enumerate(sender_polys):
+            for j, e_poly in enumerate(ego_polys):
+                if s_poly.intersects(e_poly):
+                    inter = s_poly.intersection(e_poly).area
+                    union = s_poly.area + e_poly.area - inter
+                    iou_matrix[i, j] = inter / union if union > 0 else 0.0
 
-        # Hard boundary barrier
-        if abs(dx) > self.max_trans_bound or abs(dy) > self.max_trans_bound or abs(dtheta) > self.max_yaw_bound:
-            return 1e5
-
-        shifted_sender = self._transform_boxes(sender_boxes, dx, dy, dtheta)
-
-        s_centers = shifted_sender[:, :2]
-        e_centers = ego_boxes[:, :2]
-
-        # Centroid distance matrix (N, M)
-        centroid_dists = np.linalg.norm(s_centers[:, None, :] - e_centers[None, :, :], axis=-1)
-
-        # Corner geometry distance matrix (N, M)
-        s_corners = self._get_canonical_corners_batch(shifted_sender)
-        e_corners = self._get_canonical_corners_batch(ego_boxes)
-        corner_dists = np.mean(
-            np.linalg.norm(s_corners[:, None, :, :] - e_corners[None, :, :, :], axis=-1),
-            axis=-1
-        )
-
-        # Combined Chamfer-DIoU Cost Matrix
-        cost_matrix = centroid_dists + 0.6 * corner_dists
-
-        # Optimal 1-to-1 Bipartite Matching (Prevents Greedy Collapse)
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        matched_costs = cost_matrix[row_ind, col_ind]
-
-        # Robust Inlier Gating: downweight outliers > 4.0m
-        robust_weights = 1.0 / (1.0 + (matched_costs / 2.0)**2)
-        total_loss = np.sum(matched_costs * robust_weights)
-
-        # L2 Regularizer to prevent extreme drifts
-        reg_penalty = self.reg_lambda * (dx**2 + dy**2 + (np.degrees(dtheta))**2)
-        return total_loss + reg_penalty
+        # Maximize global IoU (maximize=True is critical here!)
+        row_ind, col_ind = linear_sum_assignment(iou_matrix, maximize=True)
+        
+        # Only sum highly confident pairs
+        valid_ious = iou_matrix[row_ind, col_ind]
+        total_iou = valid_ious[valid_ious > 0.05].sum()
+        
+        return total_iou
 
     def align(self, ego_boxes, sender_boxes_ego_frame):
-        """
-        Executes Two-Stage Approach 2 Alignment:
-        1. Coarse Global Grid Search (finds global basin).
-        2. Continuous Bounded Nelder-Mead Simplex (eliminates quantization errors).
-        """
+        """Brute-force grid search to find absolute maximum IoU overlap."""
         if len(ego_boxes) == 0 or len(sender_boxes_ego_frame) == 0:
-            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
-
-        # Neighborhood pre-filter (6.0m search window)
-        candidate_sender = []
-        for s_box in sender_boxes_ego_frame:
-            dists = np.hypot(ego_boxes[:, 0] - s_box[0], ego_boxes[:, 1] - s_box[1])
-            if np.min(dists) <= 6.0:
-                candidate_sender.append(s_box)
-
-        if len(candidate_sender) == 0:
-            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
-
-        candidate_sender = np.array(candidate_sender)
-
-        # -------------------------------------------------------------
-        # STAGE 1: Coarse Grid Warm-Start (Locate Global Basin)
-        # -------------------------------------------------------------
-        coarse_x = np.linspace(-1.2, 1.2, 5)
-        coarse_y = np.linspace(-1.2, 1.2, 5)
-        coarse_yaw = np.linspace(-np.radians(3.0), np.radians(3.0), 5)
-
-        best_cost = float('inf')
-        best_seed = (0.0, 0.0, 0.0)
-
-        for dx in coarse_x:
-            for dy in coarse_y:
-                for dtheta in coarse_yaw:
-                    cost = self._compute_cost((dx, dy, dtheta), ego_boxes, candidate_sender)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_seed = (dx, dy, dtheta)
-
-        # -------------------------------------------------------------
-        # STAGE 2: Continuous Nelder-Mead Simplex Polish
-        # -------------------------------------------------------------
-        x0 = np.array(best_seed, dtype=np.float64)
-        step_x, step_y, step_theta = 0.15, 0.15, np.radians(0.75)
+            return np.eye(4), (0.0, 0.0, 0.0)
+            
+        ego_polys = [self.get_polygon(b) for b in ego_boxes]
         
-        custom_simplex = np.array([
-            x0,
-            x0 + [step_x, 0.0, 0.0],
-            x0 + [0.0, step_y, 0.0],
-            x0 + [0.0, 0.0, step_theta]
-        ])
+        # 1. Define Strict Search Grid
+        x_grid = np.linspace(-self.max_trans, self.max_trans, 9)
+        y_grid = np.linspace(-self.max_trans, self.max_trans, 9)
+        yaw_grid = np.linspace(-self.max_yaw, self.max_yaw, 5)
 
-        res = minimize(
-            self._compute_cost,
-            x0=x0,
-            args=(ego_boxes, candidate_sender),
-            method='Nelder-Mead',
-            options={
-                'initial_simplex': custom_simplex,
-                'maxiter': 40,
-                'xatol': 1e-3,  # 1mm spatial resolution
-                'fatol': 1e-3
-            }
-        )
+        best_iou = 0.0
+        best_delta = (0.0, 0.0, 0.0)
 
-        opt_dx, opt_dy, opt_dtheta = res.x
+        # 2. Evaluate Exact Geometric Overlap
+        for dx in x_grid:
+            for dy in y_grid:
+                for dyaw in yaw_grid:
+                    iou = self.compute_total_iou(ego_polys, sender_boxes_ego_frame, dx, dy, dyaw)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_delta = (dx, dy, dyaw)
+                        
+        opt_dx, opt_dy, opt_dtheta = best_delta
+        
+        # 3. Strict Gate: Ignore if highly confident pairs are not found
+        if best_iou < self.min_iou_gate:
+            return np.eye(4), (0.0, 0.0, 0.0)
+            
+        # 4. Deadband Filter: Ignore microscopic shifts
+        if abs(opt_dx) < 0.1 and abs(opt_dy) < 0.1 and abs(opt_dtheta) < np.radians(0.5):
+            return np.eye(4), (0.0, 0.0, 0.0)
 
-        # Deadband filter to protect clean baseline frames
-        if abs(opt_dx) < 0.03 and abs(opt_dy) < 0.03 and abs(opt_dtheta) < np.radians(0.15):
-            return np.eye(4, dtype=np.float64), (0.0, 0.0, 0.0)
-
-        # Construct 4x4 Homogeneous SE(3) Transformation Matrix
+        # 5. Build SE(3) Matrix
         c, s = np.cos(opt_dtheta), np.sin(opt_dtheta)
-        T_corr = np.eye(4, dtype=np.float64)
+        T_corr = np.eye(4)
         T_corr[0, 0], T_corr[0, 1] = c, -s
         T_corr[1, 0], T_corr[1, 1] = s, c
         T_corr[0, 3] = opt_dx
