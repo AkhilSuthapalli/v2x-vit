@@ -213,5 +213,5 @@ wild_setting:
   ryp_std: 0.0
   seed: 25
   transmission_speed: 27
-  xyz_std: 0.2
+  xyz_std: 0.5
 yaml_parser: load_point_pillar_params
