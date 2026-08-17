@@ -210,8 +210,8 @@ wild_setting:
   backbone_delay: 10
   data_size: 1.06
   loc_err: true 
-  ryp_std: 2
+  ryp_std: 0.0
   seed: 25
   transmission_speed: 27
-  xyz_std: 0.8
+  xyz_std: 0.0
 yaml_parser: load_point_pillar_params
