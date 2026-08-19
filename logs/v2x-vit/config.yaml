@@ -206,7 +206,7 @@ validate_dir: 'v2xset/test_truncated'   # Custom location
 wild_setting:
   async: true # earelier it was flase
   async_mode: 'sim'
-  async_overhead: 200
+  async_overhead: 400
   backbone_delay: 10
   data_size: 1.06
   loc_err: true # earlier it was false
