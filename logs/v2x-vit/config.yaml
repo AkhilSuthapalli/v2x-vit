@@ -204,7 +204,7 @@ train_params:
 # validate_dir: 'v2xset/test' # Actual location 
 validate_dir: 'v2xset/test_truncated'   # Custom location
 wild_setting:
-  async: false # earelier it was flase
+  async: true # earelier it was flase
   async_mode: 'sim'
   async_overhead: 100
   backbone_delay: 10
