@@ -88,10 +88,18 @@ def main():
             vis_aabbs_gt.append(o3d.geometry.LineSet())
             vis_aabbs_pred.append(o3d.geometry.LineSet())
 
+    # --- LATENCY TRACKING VARIABLES ---
+    total_inference_time = 0.0
+    total_frames = 0
+
     for i, batch_data in enumerate(data_loader):
-        print(i)
+        print(f"Processing frame {i}...")
         with torch.no_grad():
+
+            # --- TIMER START ---
             torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
             batch_data = train_utils.to_device(batch_data, device)
             if opt.fusion_method == 'late':
                 pred_box_tensor, pred_score, gt_box_tensor = \
@@ -111,6 +119,18 @@ def main():
             else:
                 raise NotImplementedError('Only early, late and intermediate'
                                           'fusion is supported.')
+
+            # --- TIMER END ---
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+
+            # Record latency, ignoring the first 5 frames for GPU warmup
+            frame_latency_ms = (end_time - start_time) * 1000
+            if i >= 5:  
+                total_inference_time += frame_latency_ms
+                total_frames += 1
+
+            # --- EVALUATION AND SAVING ---
             eval_utils.caluclate_tp_fp(pred_box_tensor,
                                        pred_score,
                                        gt_box_tensor,
@@ -187,6 +207,17 @@ def main():
 
     eval_utils.eval_final_results(result_stat,
                                   opt.model_dir)
+
+    # --- PRINT LATENCY METRICS ---
+    if total_frames > 0:
+        avg_latency = total_inference_time / total_frames
+        fps = 1000.0 / avg_latency
+        print("\n" + "="*55)
+        print(f"⏱️ FINAL LATENCY METRICS (Averaged over {total_frames} frames)")
+        print(f"Average End-to-End Latency : {avg_latency:.2f} ms")
+        print(f"Equivalent Frames Per Sec  : {fps:.2f} FPS")
+        print("="*55 + "\n")
+
     if opt.show_sequence:
         vis.destroy_window()
 
