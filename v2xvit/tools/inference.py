@@ -131,12 +131,12 @@ def main():
                 total_frames += 1
 
             # --- EVALUATION AND SAVING ---
-            eval_utils.calculate_tp_fp(pred_box_tensor,
+            eval_utils.caluclate_tp_fp(pred_box_tensor,
                                        pred_score,
                                        gt_box_tensor,
                                        result_stat,
                                        0.3)
-            eval_utils.calculate_tp_fp(pred_box_tensor,
+            eval_utils.caluclate_tp_fp(pred_box_tensor,
                                        pred_score,
                                        gt_box_tensor,
                                        result_stat,
@@ -217,7 +217,7 @@ def main():
         print(f"Average End-to-End Latency : {avg_latency:.2f} ms")
         print(f"Equivalent Frames Per Sec  : {fps:.2f} FPS")
         print("="*55 + "\n")
-        
+
     if opt.show_sequence:
         vis.destroy_window()
 
