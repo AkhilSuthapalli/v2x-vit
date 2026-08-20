@@ -16,6 +16,7 @@ from v2xvit.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
 
+from v2xvit.utils.alignment_iou import RobustVectorizedDIoUAligner
 
 class IntermediateFusionDataset(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
@@ -27,6 +28,10 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         self.post_processor = post_processor.build_postprocessor(
             params['postprocess'],
             train)
+        self.aligner = RobustVectorizedDIoUAligner(
+            max_trans_bound=2.0,
+            max_yaw_bound=np.radians(8.0)
+        )
 
     def __getitem__(self, idx):
         # when the cur_ego_pose_flag is set to True, there is no time gap
@@ -73,6 +78,14 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
         if self.visualize:
             projected_lidar_stack = []
 
+        # -----------------------------------------------------------------
+        # APPROACH 2 HOOK: Extract Ego Bounding Boxes as Reference Anchor
+        # -----------------------------------------------------------------
+        ego_cav_base = base_data_dict[ego_id]
+        ego_processed_ref, _ = self.get_item_single_car(ego_cav_base, ego_lidar_pose)
+        ego_boxes_ref = ego_processed_ref['object_bbx_center']
+
+        
         # loop over all CAVs to process information
         for cav_id, selected_cav_base in base_data_dict.items():
             # check if the cav is within the communication range with ego
@@ -84,6 +97,29 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                                       1]) ** 2)
             if distance > v2xvit.data_utils.datasets.COM_RANGE:
                 continue
+
+            # -------------------------------------------------------------
+            # APPROACH 2 HOOK: Perform Nelder-Mead IoU Pose Alignment
+            # -------------------------------------------------------------
+            if cav_id != ego_id and len(ego_boxes_ref) > 0:
+                sender_processed_noisy, void_check = self.get_item_single_car(
+                    selected_cav_base, ego_lidar_pose)
+    
+                if not void_check:
+                    sender_boxes_local = sender_processed_noisy['object_bbx_center']
+        
+                    if len(sender_boxes_local) > 0:
+                        T_init = selected_cav_base['params']['transformation_matrix']
+                        sender_boxes_ego_frame = self.transform_boxes_to_ego(sender_boxes_local, T_init)
+                        
+                        # Solve continuous alignment offset
+                        T_corr, (dx, dy, dtheta) = self.aligner.align(
+                            ego_boxes_ref, sender_boxes_ego_frame
+                        )
+                        
+                        # Apply correction to point cloud transformation matrix
+                        selected_cav_base['params']['transformation_matrix'] = \
+                            T_corr @ selected_cav_base['params']['transformation_matrix']
 
             selected_cav_processed, void_lidar = self.get_item_single_car(
                 selected_cav_base,
@@ -162,6 +198,25 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                 np.vstack(
                     projected_lidar_stack)})
         return processed_data_dict
+    
+    @staticmethod
+    def transform_boxes_to_ego(boxes, T):
+        """Transforms bounding boxes from CAV local frame to Ego frame using T matrix."""
+        if len(boxes) == 0:
+            return boxes
+        transformed = boxes.copy()
+        
+        # 1. Rotate and translate center coordinates (x, y)
+        R = T[:2, :2]
+        t = T[:2, 3]
+        transformed[:, :2] = transformed[:, :2] @ R.T + t
+        
+        # 2. Add heading/yaw angle offset
+        yaw_offset = np.arctan2(T[1, 0], T[0, 0])
+        yaw_idx = 6 if transformed.shape[1] > 6 else 4
+        transformed[:, yaw_idx] += yaw_offset
+        
+        return transformed
 
     @staticmethod
     def get_pairwise_transformation(base_data_dict, max_cav):

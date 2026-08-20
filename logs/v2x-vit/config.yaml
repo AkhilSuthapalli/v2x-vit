@@ -204,14 +204,14 @@ train_params:
 # validate_dir: 'v2xset/test' # Actual location 
 validate_dir: 'v2xset/test_truncated'   # Custom location
 wild_setting:
-  async: false # earelier it was flase
+  async: false
   async_mode: 'sim'
   async_overhead: 100
   backbone_delay: 10
   data_size: 1.06
-  loc_err: true # earlier it was false
-  ryp_std: 8
+  loc_err: true 
+  ryp_std: 1.0
   seed: 25
   transmission_speed: 27
-  xyz_std: 0.8
+  xyz_std: 0.5
 yaml_parser: load_point_pillar_params

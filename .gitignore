@@ -133,3 +133,4 @@ dmypy.json
 opv2x
 .DS_Store
 v2xset/
+logs/v2x-vit/vis_*/
