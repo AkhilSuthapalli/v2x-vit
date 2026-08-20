@@ -91,11 +91,12 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                             sender_boxes=sender_boxes_local
                         )
 
-                        matrix_changed = not np.allclose(noisy_T, corrected_T)
-                        print(f"[ALIGNMENT CHECK] CAV '{cav_id}' | Corrected?: {matrix_changed}")
-                        if matrix_changed:
-                            print(f"   Noisy  Shift (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
-                            print(f"   Fixed  Shift (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
+                        # Commenting debug print statements for clarity
+                        # matrix_changed = not np.allclose(noisy_T, corrected_T)
+                        # print(f"[ALIGNMENT CHECK] CAV '{cav_id}' | Corrected?: {matrix_changed}")
+                        # if matrix_changed:
+                        #     print(f"   Noisy  Shift (X, Y): ({noisy_T[0, 3]:.4f}, {noisy_T[1, 3]:.4f})")
+                        #     print(f"   Fixed  Shift (X, Y): ({corrected_T[0, 3]:.4f}, {corrected_T[1, 3]:.4f})")
 
                         # Overwrite transformation matrix
                         base_data_dict[cav_id]['params']['transformation_matrix'] = corrected_T
