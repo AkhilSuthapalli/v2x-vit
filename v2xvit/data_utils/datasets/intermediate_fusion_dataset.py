@@ -125,9 +125,9 @@ class IntermediateFusionDataset(basedataset.BaseDataset):
                     selected_cav_base['params']['transformation_matrix'] = \
                         T_corr @ selected_cav_base['params']['transformation_matrix']
 
-                    new_T = selected_cav_base['params']['transformation_matrix']
-                    print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
-                    print(f"[DEBUG DATASET] T_matrix translation AFTER : x={new_T[0,3]:.3f}, y={new_T[1,3]:.3f}\n")
+                    # new_T = selected_cav_base['params']['transformation_matrix']
+                    # print(f"[DEBUG DATASET] T_matrix translation BEFORE: x={orig_T[0,3]:.3f}, y={orig_T[1,3]:.3f}")
+                    # print(f"[DEBUG DATASET] T_matrix translation AFTER : x={new_T[0,3]:.3f}, y={new_T[1,3]:.3f}\n")
 
             # Standard processing continues
             selected_cav_processed, void_lidar = self.get_item_single_car(
