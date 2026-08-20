@@ -202,9 +202,9 @@ train_params:
   max_cav: 5
   save_freq: 1
 # validate_dir: 'v2xset/test' # Actual location 
-validate_dir: 'v2xset/test_single'   # Custom location
+validate_dir: 'v2xset/test_truncated'   # Custom location
 wild_setting:
-  async: false # earelier it was flase
+  async: false 
   async_mode: 'sim'
   async_overhead: 100
   backbone_delay: 10
